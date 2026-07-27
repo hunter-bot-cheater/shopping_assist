@@ -121,167 +121,170 @@ def get_current_stock(flower):
 # 核心功能 1：手动入库（增加库存）+ 自动补录缺口
 # =============================================
 def add_stock(flower, qty, reference="手动入库", operator="system"):
-    """增加库存（采购入库/手动补货），自动补录该花型的待补录缺口"""
+    """
+    增加库存（采购入库/手动补货）
+    同时更新 inventory 表和 inventory_snapshot 表
+    """
     if qty <= 0:
         raise ValueError("入库数量必须大于 0")
 
     with engine.connect() as conn:
         trans = conn.begin()
         try:
-            # 查询该花型所有待补录缺口
-            shortfalls = conn.execute(
-                text("""
-                    SELECT id, shortfall_meters 
-                    FROM inventory_shortfall 
-                    WHERE flower = :f AND status = '待补录'
-                    ORDER BY reference_date
-                """),
+            current = get_current_stock(flower)
+            new_stock = current + qty
+
+            # 1. 更新旧表
+            conn.execute(
+                text("UPDATE inventory SET current_stock = :new WHERE flower = :f"),
+                {"new": new_stock, "f": flower}
+            )
+
+            # 2. 获取该花型在快照表中的最新日期
+            latest_snapshot = conn.execute(
+                text("SELECT MAX(snapshot_date) FROM inventory_snapshot WHERE flower = :f"),
                 {"f": flower}
-            ).fetchall()
+            ).scalar()
 
-            if shortfalls:
-                # 转为 float（解决 Decimal 类型问题）
-                shortfall_list = [(sf[0], float(sf[1])) for sf in shortfalls]
-                total_shortfall = sum(sf[1] for sf in shortfall_list)
+            if latest_snapshot is None:
+                print(f"⚠️ {flower} 没有任何快照记录，正在补全...")
+                from inventory_service import fill_missing_snapshots
+                fill_missing_snapshots(operator=operator)
+                latest_snapshot = conn.execute(
+                    text("SELECT MAX(snapshot_date) FROM inventory_snapshot WHERE flower = :f"),
+                    {"f": flower}
+                ).scalar()
 
-                used_for_shortfall = min(qty, total_shortfall)
-                remaining_stock = qty - used_for_shortfall
+            # 🔧 没有 report_date，使用 latest_snapshot
+            update_date = latest_snapshot if latest_snapshot else datetime.now().date()
 
-                current = get_current_stock(flower)
+            # 3. 更新快照表
+            result = conn.execute(
+                text("""
+                    UPDATE inventory_snapshot
+                    SET stock = stock + :qty, updated_by = :op, updated_at = CURRENT_TIMESTAMP
+                    WHERE flower = :f AND snapshot_date >= :d
+                """),
+                {"qty": qty, "op": operator, "f": flower, "d": update_date}
+            )
+            print(f"🔍 快照表更新影响行数：{result.rowcount}")
 
-                # 按顺序补录缺口
-                remaining_to_allocate = used_for_shortfall
-                for sf_id, sf_meters in shortfall_list:
-                    if remaining_to_allocate <= 0:
-                        break
-                    to_resolve = min(remaining_to_allocate, sf_meters)
-                    conn.execute(
-                        text("""
-                            UPDATE inventory_shortfall 
-                            SET status = '已补录', resolved_at = NOW() 
-                            WHERE id = :id
-                        """),
-                        {"id": sf_id}
-                    )
-                    remaining_to_allocate -= to_resolve
-
-                # 更新库存
-                if remaining_stock > 0:
-                    new_stock = current + remaining_stock
-                    conn.execute(
-                        text("UPDATE inventory SET current_stock = :new WHERE flower = :f"),
-                        {"new": new_stock, "f": flower}
-                    )
-                else:
-                    new_stock = current
-
-                # 写流水
-                conn.execute(
-                    text("""
-                        INSERT INTO inventory_log 
-                        (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
-                        VALUES (:f, '入库', :qty, :before, :after, :ref, :op)
-                    """),
-                    {
-                        "f": flower,
-                        "qty": qty,
-                        "before": current,
-                        "after": new_stock,
-                        "ref": f"{reference} (其中 {used_for_shortfall} 米用于补录缺口)",
-                        "op": operator
-                    }
-                )
-                print(f"✅ {flower} 入库 {qty} 米，其中 {used_for_shortfall} 米用于补录缺口，净增库存 {remaining_stock} 米")
-            else:
-                # 没有缺口，正常入库
-                current = get_current_stock(flower)
-                new_stock = current + qty
-                conn.execute(
-                    text("UPDATE inventory SET current_stock = :new WHERE flower = :f"),
-                    {"new": new_stock, "f": flower}
-                )
-                conn.execute(
-                    text("""
-                        INSERT INTO inventory_log 
-                        (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
-                        VALUES (:f, '入库', :qty, :before, :after, :ref, :op)
-                    """),
-                    {"f": flower, "qty": qty, "before": current, "after": new_stock, "ref": reference, "op": operator}
-                )
-                print(f"✅ 入库成功：{flower} 增加 {qty} 米（当前库存：{new_stock}）")
+            # 4. 写入流水
+            conn.execute(
+                text("""
+                    INSERT INTO inventory_log 
+                    (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
+                    VALUES (:f, '入库', :qty, :before, :after, :ref, :op)
+                """),
+                {"f": flower, "qty": qty, "before": current, "after": new_stock, "ref": reference, "op": operator}
+            )
 
             trans.commit()
+            print(f"✅ 入库成功：{flower} 增加 {qty} 米（当前库存：{new_stock}）")
+
         except Exception as e:
             trans.rollback()
             raise e
-
-
 # =============================================
 # 核心功能 2：销售出库（减少库存）
 # =============================================
 def deduct_stock(flower, qty, reference="销售出库", operator="system", report_date=None):
-    """柔性扣减库存：能扣尽扣，扣不完的记为缺口（待补录）"""
+    """
+    手动出库：直接扣减库存，同时更新 inventory 和 inventory_snapshot
+    """
     if qty <= 0:
         raise ValueError("出库数量必须大于 0")
+
+    # 🔧 将 report_date 统一转换为 date 对象
+    if report_date is not None:
+        if isinstance(report_date, str):
+            try:
+                report_date = datetime.strptime(report_date, '%Y-%m-%d').date()
+            except ValueError:
+                report_date = datetime.strptime(report_date, '%Y%m%d').date()
+        # 如果已经是 date 对象，保持不变
+    else:
+        report_date = datetime.now().date()
 
     with engine.connect() as conn:
         trans = conn.begin()
         try:
             current = get_current_stock(flower)
+            new_stock = current - qty
 
-            if current >= qty:
-                # 库存充足，正常扣减
-                new_stock = current - qty
-                conn.execute(
-                    text("UPDATE inventory SET current_stock = :new WHERE flower = :f"),
-                    {"new": new_stock, "f": flower}
-                )
-                conn.execute(
-                    text("""
-                        INSERT INTO inventory_log 
-                        (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
-                        VALUES (:f, '销售出库', :qty, :before, :after, :ref, :op)
-                    """),
-                    {"f": flower, "qty": -qty, "before": current, "after": new_stock, "ref": reference, "op": operator}
-                )
-                print(f"✅ {flower} 扣减 {qty} 米（剩余：{new_stock}）")
+            # 1. 更新旧表
+            conn.execute(
+                text("UPDATE inventory SET current_stock = :new WHERE flower = :f"),
+                {"new": new_stock, "f": flower}
+            )
+
+            # 2. 获取该花型在快照表中的最新日期
+            latest_snapshot = conn.execute(
+                text("SELECT MAX(snapshot_date) FROM inventory_snapshot WHERE flower = :f"),
+                {"f": flower}
+            ).scalar()
+
+            if latest_snapshot is None:
+                print(f"⚠️ {flower} 没有任何快照记录，正在补全...")
+                from inventory_service import fill_missing_snapshots
+                fill_missing_snapshots(operator=operator)
+                latest_snapshot = conn.execute(
+                    text("SELECT MAX(snapshot_date) FROM inventory_snapshot WHERE flower = :f"),
+                    {"f": flower}
+                ).scalar()
+
+            # 🔧 使用 report_date 和 latest_snapshot 中较大的作为更新起始日期
+            if latest_snapshot:
+                # 两者都是 date 对象，可以比较
+                update_date = max(report_date, latest_snapshot)
             else:
-                # 库存不足 → 柔性处理
-                if current > 0:
-                    conn.execute(
-                        text("UPDATE inventory SET current_stock = 0 WHERE flower = :f"),
-                        {"f": flower}
-                    )
-                    conn.execute(
-                        text("""
-                            INSERT INTO inventory_log 
-                            (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
-                            VALUES (:f, '销售出库', :qty_deduct, :before, 0, :ref, :op)
-                        """),
-                        {"f": flower, "qty_deduct": -current, "before": current,
-                         "ref": f"{reference}(部分)", "op": operator}
-                    )
-                else:
-                    pass
+                update_date = report_date
 
-                # 记录缺口
-                shortfall = qty - current
-                conn.execute(
-                    text("""
-                        INSERT INTO inventory_shortfall 
-                        (flower, shortfall_meters, reference_date, status)
-                        VALUES (:f, :sf, :rd, '待补录')
-                    """),
-                    {"f": flower, "sf": shortfall, "rd": report_date if report_date else datetime.now().date()}
-                )
-                print(f"⚠️ {flower} 库存不足，已扣除 {max(0, current)} 米，剩余 {shortfall} 米记为缺口（待补录）")
+            # 🔧 检查更新日期之后是否有快照记录
+            check_future = conn.execute(
+                text("""
+                    SELECT COUNT(*) FROM inventory_snapshot 
+                    WHERE flower = :f AND snapshot_date >= :d
+                """),
+                {"f": flower, "d": update_date}
+            ).scalar()
+
+            if check_future == 0:
+                print(f"🔧 补全 {flower} 从 {update_date} 开始的快照...")
+                from inventory_service import fill_missing_snapshots
+                fill_missing_snapshots(operator=operator)
+
+            # 3. 更新快照表
+            result = conn.execute(
+                text("""
+                    UPDATE inventory_snapshot
+                    SET stock = stock - :qty, updated_by = :op, updated_at = CURRENT_TIMESTAMP
+                    WHERE flower = :f AND snapshot_date >= :d
+                """),
+                {"qty": qty, "op": operator, "f": flower, "d": update_date}
+            )
+            print(f"🔍 快照表更新影响行数：{result.rowcount}")
+
+            # 4. 写入流水
+            conn.execute(
+                text("""
+                    INSERT INTO inventory_log 
+                    (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
+                    VALUES (:f, '销售出库', :qty, :before, :after, :ref, :op)
+                """),
+                {"f": flower, "qty": -qty, "before": current, "after": new_stock, "ref": reference, "op": operator}
+            )
 
             trans.commit()
+
+            if new_stock < 0:
+                print(f"⚠️ {flower} 库存不足，当前库存 {current} 米，出库 {qty} 米后为 {new_stock} 米（负数表示欠货）")
+            else:
+                print(f"✅ {flower} 扣减 {qty} 米（剩余：{new_stock}）")
+
         except Exception as e:
             trans.rollback()
             raise e
-
-
 # =============================================
 # 核心功能 3：回退某一天的销售出库（用于日报重新生成）
 # =============================================
@@ -465,115 +468,69 @@ def write_off_stock(flower, qty, reason="报损", operator="system"):
 # 核心功能 7：回退库存到指定日期
 # =============================================
 def rollback_inventory_to_date(target_date, operator="system"):
-    """将库存回退到指定日期的状态（基于截止该日期的流水记录）"""
+    """
+    整体回退库存到指定日期
+    删除目标日期之后的所有快照，库存恢复到该日期状态
+    返回：(成功/失败, 消息, 受影响花型数)
+    """
     from datetime import datetime
     try:
         target_dt = datetime.strptime(target_date, "%Y-%m-%d")
     except ValueError:
-        raise ValueError("日期格式错误，请使用 YYYY-MM-DD 格式")
-
-    today = datetime.now().date()
-    if target_dt.date() > today:
-        raise ValueError("❌ 不能回退到未来的日期")
-
-    print(f"⏳ 正在将库存回退至 {target_date} ...")
+        return (False, "日期格式错误，请使用 YYYY-MM-DD 格式", 0)
 
     with engine.connect() as conn:
         trans = conn.begin()
         try:
-            flowers = conn.execute(text("SELECT flower FROM inventory")).fetchall()
-            flowers = [f[0] for f in flowers]
+            # 1. 检查目标日期的快照是否存在
+            check = conn.execute(
+                text("SELECT COUNT(*) FROM inventory_snapshot WHERE snapshot_date = :d"),
+                {"d": target_date}
+            ).scalar()
+            if check == 0:
+                trans.rollback()
+                return (False, f"❌ {target_date} 没有快照数据，无法回退", 0)
 
-            total_adjust = 0
-            rollback_details = []
+            # 2. 统计将被删除的快照数量
+            to_delete = conn.execute(
+                text("SELECT COUNT(*) FROM inventory_snapshot WHERE snapshot_date > :d"),
+                {"d": target_date}
+            ).scalar()
 
-            for flower in flowers:
-                last_log = conn.execute(
-                    text("""
-                        SELECT after_stock 
-                        FROM inventory_log 
-                        WHERE flower = :f AND DATE(created_at) <= :d
-                        ORDER BY created_at DESC 
-                        LIMIT 1
-                    """),
-                    {"f": flower, "d": target_date}
-                ).fetchone()
+            if to_delete == 0:
+                trans.rollback()
+                return (False, f"ℹ️ {target_date} 之后没有快照数据，无需回退", 0)
 
-                target_stock = float(last_log[0]) if last_log else 0.0
-                current = get_current_stock(flower)
-                adjustment = target_stock - current
+            # 3. 🔧 记录回退操作到库存流水
+            flower_count = conn.execute(
+                text("SELECT COUNT(DISTINCT flower) FROM inventory_snapshot WHERE snapshot_date = :d"),
+                {"d": target_date}
+            ).scalar()
 
-                if abs(adjustment) < 0.001:
-                    continue
+            conn.execute(
+                text("""
+                    INSERT INTO inventory_log 
+                    (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
+                    VALUES ('系统', '手动调整', 0, 0, 0, :ref, :op)
+                """),
+                {
+                    "ref": f"回退库存至 {target_date}，删除 {to_delete} 条快照记录",
+                    "op": operator
+                }
+            )
 
-                total_adjust += adjustment
-                rollback_details.append(f"{flower}: {current} → {target_stock} (调整 {adjustment:+.2f})")
-
-                new_stock = target_stock
-                if adjustment > 0:
-                    conn.execute(
-                        text("UPDATE inventory SET current_stock = :new WHERE flower = :f"),
-                        {"new": new_stock, "f": flower}
-                    )
-                    conn.execute(
-                        text("""
-                            INSERT INTO inventory_log 
-                            (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
-                            VALUES (:f, '手动调整', :qty, :before, :after, :ref, :op)
-                        """),
-                        {
-                            "f": flower,
-                            "qty": adjustment,
-                            "before": current,
-                            "after": new_stock,
-                            "ref": f"回退至 {target_date}（补库）",
-                            "op": operator
-                        }
-                    )
-                else:
-                    actual_deduct = min(abs(adjustment), current)
-                    final_stock = current - actual_deduct
-                    conn.execute(
-                        text("UPDATE inventory SET current_stock = :new WHERE flower = :f"),
-                        {"new": final_stock, "f": flower}
-                    )
-                    conn.execute(
-                        text("""
-                            INSERT INTO inventory_log 
-                            (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
-                            VALUES (:f, '手动调整', :qty, :before, :after, :ref, :op)
-                        """),
-                        {
-                            "f": flower,
-                            "qty": -actual_deduct,
-                            "before": current,
-                            "after": final_stock,
-                            "ref": f"回退至 {target_date}（多扣部分）",
-                            "op": operator
-                        }
-                    )
-
+            # 4. 删除目标日期之后的所有快照
             deleted = conn.execute(
-                text("DELETE FROM daily_report_cache WHERE report_date > :d"),
+                text("DELETE FROM inventory_snapshot WHERE snapshot_date > :d"),
                 {"d": target_date}
             ).rowcount
-            conn.commit()
 
-            print("\n" + "=" * 50)
-            print(f"✅ 回退完成！库存已恢复至 {target_date} 的状态")
-            print(f"📊 共涉及 {len(rollback_details)} 个花型，总调整量：{total_adjust:+.2f} 米")
-            print(f"🗑️ 已清理 {deleted} 条日报缓存（日期 > {target_date}）")
-            if rollback_details:
-                print("\n📝 详细调整记录：")
-                for detail in rollback_details:
-                    print(f"   {detail}")
-            print("=" * 50)
+            trans.commit()
+            return (True, f"✅ 已回退到 {target_date}，共删除 {deleted} 条快照记录", deleted)
 
         except Exception as e:
             trans.rollback()
-            raise e
-
-
+            return (False, f"❌ 回退失败：{str(e)}", 0)
 # =============================================
 # 核心功能：手动调整库存（直接设置为目标值）
 # =============================================
@@ -881,56 +838,6 @@ def fill_missing_snapshots(up_to_date=None, operator='system'):
         return (filled_count, "success", f"✅ 已补全 {filled_count} 天的快照（截至 {up_to_date.strftime('%Y-%m-%d')}）")
 
 
-def rollback_inventory_to_date(target_date, operator="system"):
-    """
-    整体回退库存到指定日期
-    删除目标日期之后的所有快照，库存恢复到该日期状态
-    返回：(成功/失败, 消息, 受影响花型数)
-    """
-    from datetime import datetime
-    try:
-        target_dt = datetime.strptime(target_date, "%Y-%m-%d")
-    except ValueError:
-        return (False, "日期格式错误，请使用 YYYY-MM-DD 格式", 0)
-
-    with engine.connect() as conn:
-        trans = conn.begin()
-        try:
-            # 1. 检查目标日期的快照是否存在
-            check = conn.execute(
-                text("SELECT COUNT(*) FROM inventory_snapshot WHERE snapshot_date = :d"),
-                {"d": target_date}
-            ).scalar()
-            if check == 0:
-                trans.rollback()
-                return (False, f"❌ {target_date} 没有快照数据，无法回退", 0)
-
-            # 2. 统计将被删除的快照数量
-            to_delete = conn.execute(
-                text("SELECT COUNT(*) FROM inventory_snapshot WHERE snapshot_date > :d"),
-                {"d": target_date}
-            ).scalar()
-
-            if to_delete == 0:
-                trans.rollback()
-                return (False, f"ℹ️ {target_date} 之后没有快照数据，无需回退", 0)
-
-            # 3. 删除目标日期之后的所有快照
-            deleted = conn.execute(
-                text("DELETE FROM inventory_snapshot WHERE snapshot_date > :d"),
-                {"d": target_date}
-            ).rowcount
-
-            trans.commit()
-            return (True, f"✅ 已回退到 {target_date}，共删除 {deleted} 条快照记录", deleted)
-
-        except Exception as e:
-            trans.rollback()
-            return (False, f"❌ 回退失败：{str(e)}", 0)
-
-
-
-
 def update_inventory_snapshot(flower, target_date, new_stock, operator='system', reason='手动调整'):
     """
     修改某天某个花型的库存，并联动更新该日期之后的所有日期
@@ -974,7 +881,27 @@ def update_inventory_snapshot(flower, target_date, new_stock, operator='system',
                 {"delta": delta, "op": operator, "f": flower, "d": target_date}
             ).rowcount
 
-            # 4. 记录变更日志
+            # 4. 🔧 新增：写入 inventory_log（库存流水）
+            # 获取修改后当天该花型的库存（即 new_stock）
+            # 但注意：如果 affected > 0，后续日期也变了，但当天快照就是 new_stock
+            # 写入一条流水记录，标明是“快照调整”
+            conn.execute(
+                text("""
+                    INSERT INTO inventory_log 
+                    (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
+                    VALUES (:f, '手动调整', :qty, :before, :after, :ref, :op)
+                """),
+                {
+                    "f": flower,
+                    "qty": delta,
+                    "before": old_stock,
+                    "after": new_stock,
+                    "ref": f"快照调整 {target_date}（{reason}）",
+                    "op": operator
+                }
+            )
+
+            # 5. 记录变更日志（inventory_change_log）
             conn.execute(
                 text("""
                     INSERT INTO inventory_change_log
@@ -991,7 +918,6 @@ def update_inventory_snapshot(flower, target_date, new_stock, operator='system',
         except Exception as e:
             trans.rollback()
             return (False, f"❌ 修改失败：{str(e)}", 0)
-
 
 def get_inventory_change_log(flower=None, days=30):
     """查询库存变更日志"""

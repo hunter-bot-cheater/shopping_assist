@@ -271,11 +271,28 @@ elif menu == "📤 出库登记":
             if not flower or qty <= 0:
                 st.error("请填写完整信息（花型和米数必填）")
             else:
-                try:
-                    deduct_stock(flower, qty, f"手工出库 {ref_date}", operator, str(ref_date))
-                    st.success(f"✅ {flower} 出库 {qty} 米成功！")
-                except Exception as e:
-                    st.error(f"❌ 出库失败：{e}")
+                # 🔧 新增：检查当前库存
+                from inventory_service import get_current_stock
+
+                current_stock = get_current_stock(flower)
+                if current_stock < qty:
+                    # 如果库存不足，弹窗提醒确认
+                    st.warning(
+                        f"⚠️ {flower} 当前库存仅 {current_stock} 米，出库 {qty} 米后将变为负数（欠货 {qty - current_stock} 米）")
+                    # 使用 st.checkbox 让用户确认
+                    confirm = st.checkbox("我确认出库，即使库存不足", key="confirm_deduct")
+                    if confirm:
+                        try:
+                            deduct_stock(flower, qty, f"手工出库 {ref_date}", operator, str(ref_date))
+                            st.success(f"✅ {flower} 出库 {qty} 米成功！（剩余库存：{current_stock - qty} 米）")
+                        except Exception as e:
+                            st.error(f"❌ 出库失败：{e}")
+                else:
+                    try:
+                        deduct_stock(flower, qty, f"手工出库 {ref_date}", operator, str(ref_date))
+                        st.success(f"✅ {flower} 出库 {qty} 米成功！")
+                    except Exception as e:
+                        st.error(f"❌ 出库失败：{e}")
 
 
 # ============================
