@@ -238,6 +238,8 @@ def load_cost_map():
             cost_per_meter
 
         FROM product_cost
+        
+        WHERE is_deleted = 0
 
         """
 

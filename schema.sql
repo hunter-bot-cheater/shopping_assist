@@ -1,8 +1,13 @@
----
+
+
 
 ## 2. schema.sql（数据库建表脚本）
 
-```sql
+    -- 先创建数据库（不存在则新建）
+CREATE DATABASE IF NOT EXISTS shop_data DEFAULT CHARACTER SET utf8mb4;
+-- 选中这个数据库，后续所有表都建在里面
+USE shop_data;
+
 -- ============================================================
 -- 布料店库存管理系统 - 数据库建表脚本
 -- 数据库名称：shop_data
@@ -184,3 +189,24 @@ CREATE INDEX idx_order_time ON data2026(order_time);
 CREATE INDEX idx_report_date ON daily_report_cache(report_date);
 CREATE INDEX idx_snapshot_date ON inventory_snapshot(snapshot_date);
 CREATE INDEX idx_flower_date ON inventory_snapshot(flower, snapshot_date);
+
+-- 增加软删除字段(增删花型)
+ALTER TABLE product_cost
+ADD COLUMN is_deleted TINYINT(1) DEFAULT 0 COMMENT '是否删除：0-正常，1-已删除',
+ADD COLUMN delete_time DATETIME DEFAULT NULL COMMENT '删除时间';
+
+ALTER TABLE product_cost ADD UNIQUE KEY uk_flower (flower);
+
+ALTER TABLE inventory_log
+MODIFY COLUMN change_type ENUM(
+    '初始化',
+    '入库',
+    '销售出库',
+    '报损',
+    '盘点调整',
+    '新增花型',
+    '删除花型',
+    '恢复花型'
+) NULL DEFAULT NULL;
+
+

@@ -68,7 +68,7 @@ def extract_meter_from_spec(spec):
 def load_cost_map():
     """从 product_cost 表加载花型成本"""
     try:
-        query = "SELECT flower, cost_per_meter FROM product_cost"
+        query = "SELECT flower, cost_per_meter FROM product_cost WHERE is_deleted = 0"
         df = pd.read_sql(query, engine)
         return dict(zip(df['flower'], df['cost_per_meter']))
     except Exception as e:
