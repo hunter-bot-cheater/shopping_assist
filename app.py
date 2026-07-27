@@ -37,63 +37,15 @@ st.title("🧵 布料店库存管理系统")
 # ============================
 menu = st.sidebar.radio(
     "导航菜单",
-    ["🏠 首页", "📦 库存总览", "📥 入库登记", "📤 出库登记",
-     "📋 库存流水", "🚨 预警中心", "📊 日报中心", "📅 库存时间线", "⚙️ 系统设置"]
+    ["🏠 首页", "📦 库存管理", "📥 入库登记", "📤 出库登记",
+     "📋 库存流水", "🚨 预警中心", "📊 日报中心", "⚙️ 系统设置"]
 )
 st.sidebar.markdown("---")
 st.sidebar.caption(f"当前时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-# ============================
-# 1. 库存总览
-# ============================
-if menu == "📦 库存总览":
-    st.header("📦 当前库存总览")
-    # 显示数据日期范围
-    with engine.connect() as conn:
-        date_range = conn.execute(
-            text("SELECT MIN(order_time), MAX(order_time) FROM data2026")
-        ).fetchone()
-        if date_range and date_range[0]:
-            st.caption(f"📅 数据覆盖范围：{date_range[0].strftime('%Y-%m-%d')}  ~  {date_range[1].strftime('%Y-%m-%d')}")
-        else:
-            st.caption("📅 暂无订单数据")
-    df = get_inventory_report()
-
-    # 添加"可售天数"列（基于近7天日均销量）
-    with engine.connect() as conn:
-        avg_sales = pd.read_sql(
-            text("""
-                SELECT flower, AVG(total_meters) as avg_daily
-                FROM daily_report_cache
-                WHERE report_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
-                GROUP BY flower
-            """),
-            conn
-        )
-    avg_map = dict(zip(avg_sales['flower'], avg_sales['avg_daily']))
-    df['近7天日均销量'] = df['花型'].apply(lambda x: round(avg_map.get(x, 0), 2))
-    df['可售天数'] = df.apply(
-        lambda row: round(row['当前库存(米)'] / row['近7天日均销量'], 1) if row['近7天日均销量'] > 0 else float('inf'),
-        axis=1
-    )
 
 
-    # 高亮低库存
-    def color_rows(row):
-        if row['可售天数'] != float('inf') and row['可售天数'] < row['预警天数']:
-            return ['background-color: #ffcccc'] * len(row)
-        return [''] * len(row)
-
-
-    st.dataframe(
-        df.style.apply(color_rows, axis=1),
-        width='stretch',
-        height=500
-    )
-
-    st.caption("🔴 红色行 = 可售天数低于预警阈值，建议补货")
-
-elif menu == "🏠 首页":
+if menu == "🏠 首页":
     from system_service import get_system_start_date
     from inventory_service import get_system_status, get_missing_report_dates
 
@@ -594,28 +546,44 @@ elif menu == "📊 退款明细":
         st.info("没有找到符合条件的退款记录")
 
 
-elif menu == "📅 库存时间线":
-    st.header("📅 库存时间线")
-    st.info("查看任意日期的库存，并可修改特定日期的库存（自动联动后续日期）")
+elif menu == "📦 库存管理":
+    st.header("📦 库存管理")
+    st.caption("查看任意日期的库存，修改某天花型库存（自动联动后续日期），或回退到该天")
 
-    from inventory_service import get_inventory_snapshot, get_latest_snapshot_date, update_inventory_snapshot, \
-        rollback_inventory_to_date
+    from inventory_service import (
+        get_inventory_snapshot, get_latest_snapshot_date,
+        update_inventory_snapshot, rollback_inventory_to_date
+    )
     from system_service import get_system_start_date
+    from mysql_conn import engine
+    from sqlalchemy import text
 
     start_date = get_system_start_date()
     max_date = get_latest_snapshot_date() or date.today()
     default_date = max_date if max_date > start_date else start_date
 
-    col1, col2 = st.columns([3, 1])
+    # ============================================================
+    # 顶部：日期选择 + 回退按钮
+    # ============================================================
+    col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
-        target_date = st.date_input("选择日期", value=default_date, max_value=date.today())
+        target_date = st.date_input(
+            "📅 选择日期",
+            value=default_date,
+            max_value=date.today(),
+            key="inventory_date"
+        )
     with col2:
-        # 🔄 按钮改为“回退到该天”
         if st.button("🔄 回退到该天", use_container_width=True, type="secondary"):
             st.session_state['rollback_date'] = target_date
             st.session_state['show_rollback_confirm'] = True
+    with col3:
+        if st.button("🔄 刷新", use_container_width=True):
+            st.rerun()
 
-    # 显示确认对话框
+    # ============================================================
+    # 回退确认对话框
+    # ============================================================
     if st.session_state.get('show_rollback_confirm', False):
         rollback_date = st.session_state['rollback_date']
         st.warning(f"⚠️ 您确认要将库存回退到 **{rollback_date.strftime('%Y-%m-%d')}** 吗？")
@@ -644,15 +612,75 @@ elif menu == "📅 库存时间线":
 
         st.divider()
 
-    # 显示该日库存
+    # ============================================================
+    # 获取该日库存数据
+    # ============================================================
     df = get_inventory_snapshot(target_date)
     if df.empty:
         st.warning(f"⚠️ {target_date} 没有库存数据，请先生成日报或补全快照")
     else:
+        # ============================================================
+        # 计算近7天日均销量和可售天数
+        # ============================================================
+        with engine.connect() as conn:
+            avg_sales = pd.read_sql(
+                text("""
+                    SELECT flower, AVG(total_meters) as avg_daily
+                    FROM daily_report_cache
+                    WHERE report_date >= DATE_SUB(:target_date, INTERVAL 7 DAY)
+                      AND report_date <= :target_date
+                    GROUP BY flower
+                """),
+                conn,
+                params={"target_date": target_date}
+            )
+        avg_map = dict(zip(avg_sales['flower'], avg_sales['avg_daily']))
+
+        df['近7天日均销量'] = df['花型'].apply(
+            lambda x: round(avg_map.get(x, 0), 2)
+        )
+        df['可售天数'] = df.apply(
+            lambda row: round(row['库存'] / row['近7天日均销量'], 1)
+            if row['近7天日均销量'] > 0 else float('inf'),
+            axis=1
+        )
+
+
+        def color_rows(row):
+            if row['可售天数'] != float('inf') and row['可售天数'] < 7:
+                return ['background-color: #ffcccc'] * len(row)
+            return [''] * len(row)
+
+
+        # ============================================================
+        # 显示统计信息和表格
+        # ============================================================
+        st.subheader(f"📊 {target_date} 的库存（共 {len(df)} 个花型）")
+
+        total_stock = df['库存'].sum()
+        col_stat1, col_stat2, col_stat3 = st.columns(3)
+        with col_stat1:
+            st.metric("合计库存", f"{total_stock:.2f} 米")
+        with col_stat2:
+            low_stock_count = len(df[(df['可售天数'] != float('inf')) & (df['可售天数'] < 7)])
+            st.metric("⚠️ 低于预警阈值", f"{low_stock_count} 个花型", delta="需补货" if low_stock_count > 0 else None)
+        with col_stat3:
+            no_sales_count = len(df[df['近7天日均销量'] == 0])
+            st.metric("📊 无销量花型", f"{no_sales_count} 个")
+
+        st.dataframe(
+            df.style.apply(color_rows, axis=1),
+            use_container_width=True,
+            height=400
+        )
+        st.caption("🔴 红色行 = 可售天数低于7天，建议补货")
+
+        # ============================================================
+        # 修改库存表单
+        # ============================================================
         st.divider()
         st.subheader("✏️ 修改该日库存")
 
-        # 花型选择（放在表单外部）
         flower = st.selectbox(
             "选择花型",
             options=df['花型'].tolist(),
@@ -661,21 +689,25 @@ elif menu == "📅 库存时间线":
             key="modify_flower"
         )
 
-        # 只有选择了花型才继续
         if flower is not None:
             current_stock = float(df[df['花型'] == flower]['库存'].iloc[0])
+            current_avg = float(df[df['花型'] == flower]['近7天日均销量'].iloc[0])
 
             with st.form("modify_snapshot"):
-                new_stock = st.number_input(
-                    "新库存（米）",
-                    min_value=0.0,
-                    step=0.5,
-                    value=None,
-                    placeholder=f"当前库存：{current_stock} 米"
-                )
+                col1, col2 = st.columns(2)
+                with col1:
+                    new_stock = st.number_input(
+                        "新库存（米）",
+                        min_value=0.0,
+                        step=0.5,
+                        value=None,
+                        placeholder=f"当前库存：{current_stock} 米"
+                    )
+                    st.caption(f"📌 当前库存：**{current_stock}** 米 | 日均销量：**{current_avg}** 米")
+                with col2:
+                    reason = st.text_input("修改原因", placeholder="例：盘点调整")
 
-                reason = st.text_input("修改原因", placeholder="例：盘点调整")
-                submitted = st.form_submit_button("确认修改")
+                submitted = st.form_submit_button("✅ 确认修改", use_container_width=True)
 
                 if submitted:
                     if new_stock is None or new_stock < 0:
@@ -698,7 +730,6 @@ elif menu == "📅 库存时间线":
                             st.error(msg)
         else:
             st.info("👆 请先选择一个花型")
-
 elif menu == "⚙️ 系统设置":
     st.header("⚙️ 系统设置")
 
