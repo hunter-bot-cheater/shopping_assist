@@ -69,10 +69,6 @@ def load_cost_map(report_date=None):
     """
     按报表日期加载成本
     规则：未删除 或 删除生效日期 > 报表日期（即删除日期之后才隐藏）
-
-    例如：花型在 2026-07-10 删除，delete_effect_date = 2026-07-10
-    - 生成 2026-07-09 日报：2026-07-10 > 2026-07-09 = True → 包含 ✅
-    - 生成 2026-07-10 日报：2026-07-10 > 2026-07-10 = False → 不包含 ✅
     """
     try:
         if not report_date:
@@ -82,14 +78,13 @@ def load_cost_map(report_date=None):
               SELECT flower, cost_per_meter
               FROM product_cost
               WHERE is_deleted = 0
-                 OR (is_deleted = 1 AND delete_effect_date > :report_date) \
+                 OR (is_deleted = 1 AND delete_effect_date > %s)
               """
-        df = pd.read_sql(sql, engine, params={"report_date": report_date})
+        df = pd.read_sql(sql, engine, params=(report_date,))
         return dict(zip(df['flower'], df['cost_per_meter']))
     except Exception as e:
         print(f"加载成本表失败: {e}")
         return {}
-
 # ============================
 # 主函数
 # ============================
@@ -354,11 +349,37 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     df['是否退款'] = df['after_sale_status'].astype(str).str.contains('退款成功', na=False)
 
     # ============================================================
+    # 正常订单（汇总表用：排除所有退款和取消）
+    # ============================================================
+    normal_df = df[(~df['是否退款']) & (df['order_status'] != '已取消')]
+
+    # ============================================================
+    # 明细表数据：正常订单 + 已发货/已收货退款订单（用于对账/运费核算）
+    # ============================================================
+    # 需要保留的退款状态（涉及运费承担）
+    keep_refund_statuses = [
+        '已发货，退款成功',
+        '已收货，退款成功'
+    ]
+
+    # 明细表数据：正常订单 + 符合条件的退款订单
+    detail_df = df[
+        (df['order_status'] != '已取消') &
+        (
+                (~df['是否退款']) |
+                (df['order_status'].isin(keep_refund_statuses))
+        )
+        ].copy()
+
+    # 退款订单的成本和米数设为 0
+    detail_df.loc[detail_df['是否退款'] == True, ['成本', '米数']] = 0
+
+    # ============================================================
     # 明细表
     # ============================================================
     detail_cols = ['花型', '成本', '米数', 'merchant_income', '快递费', '盈利',
                    'after_sale_status', 'order_no', 'product_spec', 'product_quantity', '是否退款']
-    detail = df[detail_cols].copy()
+    detail = detail_df[detail_cols].copy()
     detail = detail.rename(columns={
         'merchant_income': '营业额',
         'after_sale_status': '售后状态',
@@ -366,10 +387,6 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
         'product_quantity': '商品数量'
     })
     detail = detail.sort_values('花型')
-    # ============================================================
-    # 正常订单（排除退款和取消）
-    # ============================================================
-    normal_df = df[(~df['是否退款']) & (df['order_status'] != '已取消')]
 
     # ============================================================
     # 写入日报缓存
@@ -648,4 +665,4 @@ if __name__ == "__main__":
             generate_daily_report(sys.argv[1], force=True)
     else:
             # 默认生成指定日期的日报（可自行修改日期）
-            generate_daily_report("2026-07-01")
+            generate_daily_report("2026-07-11")
