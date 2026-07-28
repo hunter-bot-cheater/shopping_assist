@@ -26,9 +26,9 @@ from mysql_conn import engine
 # ============================
 @st.cache_data(ttl=300)
 def get_flower_list():
-    """从 product_cost 表获取所有**正常**花型名称（已过滤已删除）"""
-    from add_del_flower import get_all_flowers
-    df = get_all_flowers(include_deleted=False)
+    """获取当天可用的花型（只显示未删除的）"""
+    from add_del_flower import get_available_flowers
+    df = get_available_flowers()
     return df['flower'].tolist()
 # ============================
 # 页面配置
@@ -902,6 +902,13 @@ elif menu == "🌸 花型管理":
     if flowers_df.empty:
         st.info("暂无花型数据")
     else:
+        display_df = flowers_df.copy()
+        display_df['状态'] = display_df['is_deleted'].apply(lambda x: '已删除' if x == 1 else '正常')
+        display_df = display_df.rename(columns={
+            'flower': '花型名称',
+            'cost_per_meter': '成本单价(元/米)',
+            'delete_effect_date': '删除生效日期'
+        })
         # 样式：已删除的行置灰
         def style_deleted(row):
             if row['状态'] == '已删除':

@@ -128,6 +128,10 @@ def add_stock(flower, qty, reference="手动入库", operator="system"):
     if qty <= 0:
         raise ValueError("入库数量必须大于 0")
 
+    active, msg = check_flower_active(flower)
+    if not active:
+        raise ValueError(msg)
+
     with engine.connect() as conn:
         trans = conn.begin()
         try:
@@ -194,6 +198,10 @@ def deduct_stock(flower, qty, reference="销售出库", operator="system", repor
     """
     if qty <= 0:
         raise ValueError("出库数量必须大于 0")
+
+    active, msg = check_flower_active(flower)
+    if not active:
+        raise ValueError(msg)
 
     # 🔧 将 report_date 统一转换为 date 对象
     if report_date is not None:
@@ -438,6 +446,10 @@ def write_off_stock(flower, qty, reason="报损", operator="system"):
     """报损（次品、裁剪损耗等）"""
     if qty <= 0:
         raise ValueError("报损数量必须大于 0")
+
+    active, msg = check_flower_active(flower)
+    if not active:
+        raise ValueError(msg)
     with engine.connect() as conn:
         trans = conn.begin()
         try:
@@ -543,6 +555,10 @@ def adjust_stock(flower, target_stock, reference="手动调整", operator="syste
         raise ValueError("目标库存不能为负数")
     if not flower:
         raise ValueError("花型名称不能为空")
+
+    active, msg = check_flower_active(flower)
+    if not active:
+        raise ValueError(msg)
 
     with engine.connect() as conn:
         trans = conn.begin()
@@ -1042,6 +1058,18 @@ def get_missing_report_dates():
         # 缺失日报 = 有订单但没生成日报
         missing = [d for d in order_dates_set if d not in report_dates_set]
         return sorted(missing)
+def check_flower_active(flower):
+    """检查花型是否可用（未删除）"""
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT is_deleted FROM product_cost WHERE flower = :f"),
+            {"f": flower}
+        ).fetchone()
+        if not result:
+            return (False, f"花型「{flower}」不存在")
+        if result[0] == 1:
+            return (False, f"花型「{flower}」已被删除，无法操作")
+        return (True, "")
 # =============================================
 # 测试代码
 # =============================================

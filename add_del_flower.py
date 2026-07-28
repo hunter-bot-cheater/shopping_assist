@@ -133,8 +133,9 @@ def add_flower(flower_name, cost_per_meter=0.0, operator="system"):
 
 def delete_flower(flower_name, operator="system"):
     """
-    软删除花型：标记 is_deleted = 1
-    返回 (成功/失败, 消息)
+    软删除花型
+    - 立即生效：禁止入库/出库等操作
+    - 报表层面：历史日报保留，删除当天及之后的日报不包含
     """
     if not flower_name:
         return (False, "请选择花型")
@@ -142,7 +143,6 @@ def delete_flower(flower_name, operator="system"):
     with engine.connect() as conn:
         trans = conn.begin()
         try:
-            # 检查是否存在
             existing = conn.execute(
                 text("SELECT is_deleted FROM product_cost WHERE flower = :f"),
                 {"f": flower_name}
@@ -152,38 +152,29 @@ def delete_flower(flower_name, operator="system"):
             if existing[0] == 1:
                 return (False, f"❌ 花型「{flower_name}」已处于删除状态")
 
-            # 标记删除
-            conn.execute(
-                text("""
-                    UPDATE product_cost 
-                    SET is_deleted = 1, delete_time = NOW()
-                    WHERE flower = :f
-                """),
-                {"f": flower_name}
-            )
+            # 🔧 删除立即生效（is_deleted = 1），同时记录生效日期（用于日报判断）
+            conn.execute(text("""
+                UPDATE product_cost 
+                SET is_deleted = 1, 
+                    delete_time = NOW(), 
+                    delete_effect_date = CURDATE()  -- 当天生效
+                WHERE flower = :f
+            """), {"f": flower_name})
 
             # 写入流水
-            conn.execute(
-                text("""
-                    INSERT INTO inventory_log 
-                    (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
-                    VALUES (:f, '删除花型', 0, 0, 0, '软删除花型', :op)
-                """),
-                {"f": flower_name, "op": operator}
-            )
+            conn.execute(text("""
+                INSERT INTO inventory_log 
+                (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
+                VALUES (:f, '删除花型', 0, 0, 0, CONCAT('删除花型，生效日期：', CURDATE()), :op)
+            """), {"f": flower_name, "op": operator})
 
             trans.commit()
-            return (True, f"✅ 花型「{flower_name}」已删除（历史数据保留）")
+            return (True, f"✅ 花型「{flower_name}」已删除，立即生效")
         except Exception as e:
             trans.rollback()
             return (False, f"❌ 删除失败：{str(e)}")
-
-
 def restore_flower(flower_name, operator="system"):
-    """
-    恢复已删除的花型
-    返回 (成功/失败, 消息)
-    """
+    """恢复已删除花型，清空生效日期"""
     if not flower_name:
         return (False, "请选择花型")
 
@@ -199,26 +190,38 @@ def restore_flower(flower_name, operator="system"):
             if existing[0] == 0:
                 return (False, f"❌ 花型「{flower_name}」未被删除")
 
-            conn.execute(
-                text("""
-                    UPDATE product_cost 
-                    SET is_deleted = 0, delete_time = NULL
-                    WHERE flower = :f
-                """),
-                {"f": flower_name}
-            )
+            conn.execute(text("""
+                              UPDATE product_cost
+                              SET is_deleted         = 0,
+                                  delete_time        = NULL,
+                                  delete_effect_date = NULL
+                              WHERE flower = :f
+                              """), {"f": flower_name})
 
-            conn.execute(
-                text("""
-                    INSERT INTO inventory_log 
-                    (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
-                    VALUES (:f, '恢复花型', 0, 0, 0, '恢复已删除花型', :op)
-                """),
-                {"f": flower_name, "op": operator}
-            )
+            conn.execute(text("""
+                              INSERT INTO inventory_log
+                              (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
+                              VALUES (:f, '恢复花型', 0, 0, 0, '恢复已删除花型', :op)
+                              """), {"f": flower_name, "op": operator})
 
             trans.commit()
             return (True, f"✅ 花型「{flower_name}」已恢复")
         except Exception as e:
             trans.rollback()
             return (False, f"❌ 恢复失败：{str(e)}")
+
+
+def get_available_flowers(biz_date=None):
+    """
+    获取当前可用的花型（用于入库/出库下拉选择）
+    只返回未删除的花型（is_deleted = 0）
+    """
+    with engine.connect() as conn:
+        query = text("""
+            SELECT flower, cost_per_meter
+            FROM product_cost
+            WHERE is_deleted = 0
+            ORDER BY flower ASC
+        """)
+        df = pd.read_sql(query, conn)
+    return df

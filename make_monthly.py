@@ -215,68 +215,23 @@ def extract_meter_from_spec(spec):
 
 # ----------------------------------------------------------
 
-def load_cost_map():
-
+def load_cost_map(biz_date):
     """
-    读取商品成本表
-
-    product_cost:
-
-    flower
-    cost_per_meter
-
+    读取商品成本，biz_date=报表日期
+    规则：未删除 OR 删除生效日期 > 报表日期，当月仍参与统计
     """
-
     try:
-
         sql="""
-
         SELECT
-
             flower,
-
             cost_per_meter
-
         FROM product_cost
-        
-        WHERE is_deleted = 0
-
+        WHERE is_deleted = 0 OR delete_effect_date > :biz_date
         """
-
-
-        df=pd.read_sql(
-
-            sql,
-
-            engine
-
-        )
-
-
-        return dict(
-
-            zip(
-
-                df['flower'],
-
-                df['cost_per_meter']
-
-            )
-
-        )
-
-
-
+        df=pd.read_sql(text(sql), engine, params={"biz_date": biz_date})
+        return dict(zip(df['flower'], df['cost_per_meter']))
     except Exception as e:
-
-
-        print(
-
-            f"读取成本表失败:{e}"
-
-        )
-
-
+        print(f"读取成本表失败:{e}")
         return {}
 
 

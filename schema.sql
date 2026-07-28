@@ -204,9 +204,26 @@ MODIFY COLUMN change_type ENUM(
     '销售出库',
     '报损',
     '盘点调整',
+    '手动调整',
     '新增花型',
     '删除花型',
     '恢复花型'
 ) NULL DEFAULT NULL;
 
+ALTER TABLE product_cost
+ADD COLUMN delete_effect_date DATE DEFAULT NULL
+COMMENT '删除生效日期，该日期及之后业务隐藏该花型';
 
+# SELECT
+#     flower,
+#     cost_per_meter,
+#     is_deleted,
+#     delete_time,
+#     delete_effect_date,
+#     CASE
+#         WHEN is_deleted = 0 THEN '正常'
+#         WHEN delete_effect_date > CURDATE() THEN '待生效（次日生效）'
+#         ELSE '已删除'
+#     END AS status
+# FROM product_cost
+# ORDER BY is_deleted, flower;
