@@ -67,24 +67,20 @@ def extract_meter_from_spec(spec):
 
 def load_cost_map(report_date=None):
     """
-    按报表日期加载成本
-    规则：未删除 或 删除生效日期 > 报表日期（即删除日期之后才隐藏）
-
-    例如：花型在 2026-07-10 删除，delete_effect_date = 2026-07-10
-    - 生成 2026-07-09 日报：2026-07-10 > 2026-07-09 = True → 包含 ✅
-    - 生成 2026-07-10 日报：2026-07-10 > 2026-07-10 = False → 不包含 ✅
+    加载成本表
+    规则：未删除 或 删除时间 > 报表日期（即删除日期之后才隐藏）
     """
     try:
         if not report_date:
             report_date = datetime.now().strftime("%Y-%m-%d")
 
         sql = """
-              SELECT flower, cost_per_meter
-              FROM product_cost
-              WHERE is_deleted = 0
-                 OR (is_deleted = 1 AND delete_effect_date > :report_date) \
-              """
-        df = pd.read_sql(sql, engine, params={"report_date": report_date})
+            SELECT flower, cost_per_meter
+            FROM product_cost
+            WHERE is_deleted = 0
+               OR (is_deleted = 1 AND delete_effect_date > %s)
+        """
+        df = pd.read_sql(sql, engine, params=(report_date,))
         return dict(zip(df['flower'], df['cost_per_meter']))
     except Exception as e:
         print(f"加载成本表失败: {e}")

@@ -232,6 +232,7 @@ elif menu == "📥 入库登记":
             )
             qty = st.number_input("入库米数 *", min_value=0.5, step=0.5, format="%.1f")
         with col2:
+            stock_date = st.date_input("入库日期", value=date.today(), help="入库生效日期，该日期及之后的库存都会增加")
             ref = st.text_input("备注", placeholder="例：2026-07-25 第一批进货")
             operator = st.text_input("操作人", value="admin")
 
@@ -242,8 +243,8 @@ elif menu == "📥 入库登记":
                 st.error("请填写完整信息（花型和米数必填）")
             else:
                 try:
-                    add_stock(flower, qty, ref or "手动入库", operator)
-                    st.toast(f"✅ {flower} 入库 {qty} 米成功！")
+                    add_stock(flower, qty, ref or "手动入库", operator, target_date=str(stock_date))
+                    st.toast(f"✅ {flower} 入库 {qty} 米成功！（生效日期：{stock_date}）")
                     st.balloons()
                 except Exception as e:
                     st.error(f"❌ 入库失败：{e}")
@@ -252,8 +253,10 @@ elif menu == "📥 入库登记":
 # ============================
 # 3. 出库登记
 # ============================
+
 elif menu == "📤 出库登记":
     st.header("📤 出库登记（手动扣减/线下销售）")
+    st.caption("💡 库存不足时仍可出库，库存最低保持为 0（不会出现负数）")
 
     with st.form("deduct_stock_form"):
         col1, col2 = st.columns(2)
@@ -268,7 +271,7 @@ elif menu == "📤 出库登记":
             )
             qty = st.number_input("出库米数 *", min_value=0.5, step=0.5, format="%.1f")
         with col2:
-            ref_date = st.date_input("销售日期", value=date.today())
+            ref_date = st.date_input("销售日期", value=date.today(), help="出库日期，该日期及之后的库存都会减少")
             operator = st.text_input("操作人", value="admin")
 
         submitted = st.form_submit_button("✅ 确认出库")
@@ -277,29 +280,15 @@ elif menu == "📤 出库登记":
             if not flower or qty <= 0:
                 st.error("请填写完整信息（花型和米数必填）")
             else:
-                # 🔧 新增：检查当前库存
-                from inventory_service import get_current_stock
-
-                current_stock = get_current_stock(flower)
-                if current_stock < qty:
-                    # 如果库存不足，弹窗提醒确认
-                    st.warning(
-                        f"⚠️ {flower} 当前库存仅 {current_stock} 米，出库 {qty} 米后将变为负数（欠货 {qty - current_stock} 米）")
-                    # 使用 st.checkbox 让用户确认
-                    confirm = st.checkbox("我确认出库，即使库存不足", key="confirm_deduct")
-                    if confirm:
-                        try:
-                            deduct_stock(flower, qty, f"手工出库 {ref_date}", operator, str(ref_date))
-                            st.success(f"✅ {flower} 出库 {qty} 米成功！（剩余库存：{current_stock - qty} 米）")
-                        except Exception as e:
-                            st.error(f"❌ 出库失败：{e}")
-                else:
-                    try:
-                        deduct_stock(flower, qty, f"手工出库 {ref_date}", operator, str(ref_date))
-                        st.success(f"✅ {flower} 出库 {qty} 米成功！")
-                    except Exception as e:
-                        st.error(f"❌ 出库失败：{e}")
-
+                try:
+                    deduct_stock(flower, qty, f"手工出库 {ref_date}", operator, str(ref_date))
+                    # 显示当前库存
+                    from inventory_service import get_current_stock
+                    current = get_current_stock(flower)
+                    st.toast(f"✅ {flower} 出库 {qty} 米成功！当前库存：{current} 米")
+                    st.balloons()
+                except Exception as e:
+                    st.error(f"❌ 出库失败：{e}")
 
 # ============================
 # 4. 库存流水
@@ -309,72 +298,108 @@ elif menu == "📋 库存流水":
 
     col1, col2 = st.columns(2)
     with col1:
-        flower_list = get_flower_list()
-        # 加一个"全部"选项在最前面
-        flower_options = ["（全部）"] + flower_list
+        # 🔧 修改：获取所有花型（含已删除）用于流水查询
+        from add_del_flower import get_all_flowers
+
+        all_flowers_df = get_all_flowers(include_deleted=True)
+        all_flower_list = all_flowers_df['flower'].tolist()
+
+        flower_options = ["（全部）"] + all_flower_list
         flower_filter = st.selectbox(
             "按花型筛选",
             options=flower_options,
             placeholder="输入花型名称搜索...",
-            help="支持模糊搜索，选择具体花型查看流水，或选择「全部」",
+            help="支持模糊搜索，选择具体花型查看流水（含已删除花型），或选择「全部」",
             index=None,
         )
-        # 后续查询逻辑需要调整：如果选的是"（全部）"，则传 None
-        # 原来调用 get_stock_log 的地方改为：
-        # actual_flower = None if flower_filter == "（全部）" else flower_filter
-        # df = get_stock_log(actual_flower, days)
     with col2:
         days = st.number_input("查询最近天数", min_value=1, max_value=90, value=30)
 
     if st.button("🔍 查询"):
         actual_flower = None if flower_filter == "（全部）" else flower_filter
         df = get_stock_log(actual_flower, days)
+
         if df.empty:
             st.info("没有找到相关流水记录")
         else:
-            st.dataframe(df, width='stretch')
+            # 定义变动类型映射
+            type_map = {
+                '初始化': '🔄 初始化',
+                '入库': '📥 入库',
+                '销售出库': '📤 销售出库',
+                '报损': '⚠️ 报损',
+                '盘点调整': '📊 盘点调整',
+                '手动调整': '✏️ 手动调整',
+                '新增花型': '➕ 新增花型',
+                '删除花型': '🗑️ 删除花型',
+                '恢复花型': '♻️ 恢复花型'
+            }
+
+            if '变动类型' in df.columns:
+                df['变动类型'] = df['变动类型'].map(type_map).fillna(df['变动类型'])
+
+            st.dataframe(df, use_container_width=True)
 
 
 elif menu == "🚨 预警中心":
     st.header("🚨 补货预警")
 
-    # 使用最新库存
     from inventory_service import get_inventory_report, get_latest_snapshot_date
+    from add_del_flower import get_available_flowers
 
     latest_date = get_latest_snapshot_date()
     if not latest_date:
         st.info("暂无库存数据")
     else:
-        inv_df = get_inventory_report()
-        with engine.connect() as conn:
-            avg_sales = pd.read_sql(
-                text("""
-                    SELECT flower, AVG(total_meters) as avg_daily
-                    FROM daily_report_cache
-                    WHERE report_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
-                    GROUP BY flower
-                """),
-                conn
-            )
-        avg_map = dict(zip(avg_sales['flower'], avg_sales['avg_daily']))
-        inv_df['日均销量'] = inv_df['花型'].apply(lambda x: round(avg_map.get(x, 0), 2))
-        inv_df['可售天数'] = inv_df.apply(
-            lambda row: round(row['当前库存(米)'] / row['日均销量'], 1) if row['日均销量'] > 0 else float('inf'),
-            axis=1
-        )
-        alert_df = inv_df[
-            (inv_df['可售天数'] != float('inf')) &
-            (inv_df['可售天数'] < inv_df['预警天数'])
-            ]
+        # 🔧 获取可用花型（未删除的）
+        available_df = get_available_flowers()
+        available_flowers = set(available_df['flower'].tolist())
 
-        if not alert_df.empty:
-            st.subheader("⚠️ 以下花型库存不足（可售天数低于阈值）")
-            st.dataframe(
-                alert_df[['花型', '当前库存(米)', '日均销量', '可售天数', '预警天数']],
-                width='stretch'
-            )
+        if not available_flowers:
+            st.info("当前没有可用的花型")
         else:
-            st.success("✅ 所有花型库存充足，暂无补货预警")
+            inv_df = get_inventory_report()
+
+            # 🔧 只保留可用花型（未删除的）
+            inv_df = inv_df[inv_df['花型'].isin(available_flowers)]
+
+            if inv_df.empty:
+                st.info("当前没有可用的花型数据")
+            else:
+                with engine.connect() as conn:
+                    avg_sales = pd.read_sql(
+                        text("""
+                             SELECT flower, AVG(total_meters) as avg_daily
+                             FROM daily_report_cache
+                             WHERE report_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+                             GROUP BY flower
+                             """),
+                        conn
+                    )
+                avg_map = dict(zip(avg_sales['flower'], avg_sales['avg_daily']))
+                inv_df['日均销量'] = inv_df['花型'].apply(lambda x: round(avg_map.get(x, 0), 2))
+                inv_df['可售天数'] = inv_df.apply(
+                    lambda row: round(row['当前库存(米)'] / row['日均销量'], 1) if row['日均销量'] > 0 else float(
+                        'inf'),
+                    axis=1
+                )
+                alert_df = inv_df[
+                    (inv_df['可售天数'] != float('inf')) &
+                    (inv_df['可售天数'] < inv_df['预警天数'])
+                    ]
+
+                if not alert_df.empty:
+                    st.subheader("⚠️ 以下花型库存不足（可售天数低于阈值）")
+                    st.dataframe(
+                        alert_df[['花型', '当前库存(米)', '日均销量', '可售天数', '预警天数']],
+                        use_container_width=True
+                    )
+
+                    # 🔧 显示当前可用花型总数
+                    st.caption(f"📊 当前监控花型数：{len(inv_df)} 个（已排除已删除花型）")
+                else:
+                    st.success("✅ 所有花型库存充足，暂无补货预警")
+                    st.caption(f"📊 当前监控花型数：{len(inv_df)} 个（已排除已删除花型）")
 
 elif menu == "📊 日报中心":
     st.header("📊 日报与报表")
