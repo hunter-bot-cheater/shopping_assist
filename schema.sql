@@ -197,6 +197,8 @@ ADD COLUMN delete_time DATETIME DEFAULT NULL COMMENT '删除时间';
 
 ALTER TABLE product_cost ADD UNIQUE KEY uk_flower (flower);
 
+truncate table inventory_log;
+
 ALTER TABLE inventory_log
 MODIFY COLUMN change_type ENUM(
     '初始化',
@@ -214,6 +216,7 @@ ALTER TABLE product_cost
 ADD COLUMN delete_effect_date DATE DEFAULT NULL
 COMMENT '删除生效日期，该日期及之后业务隐藏该花型';
 
+SHOW FULL COLUMNS FROM inventory_log WHERE Field = 'change_type';
 # SELECT
 #     flower,
 #     cost_per_meter,
@@ -227,3 +230,18 @@ COMMENT '删除生效日期，该日期及之后业务隐藏该花型';
 #     END AS status
 # FROM product_cost
 # ORDER BY is_deleted, flower;
+
+# USE shop_data;
+#
+# -- 1. 查看 product_cost 表是否有数据
+# SELECT COUNT(*) AS total_count FROM product_cost;
+#
+# -- 2. 查看具体数据
+# SELECT flower, cost_per_meter, is_deleted, delete_effect_date
+# FROM product_cost
+# ORDER BY flower;
+#
+# -- 3. 查看是否有花型被标记为删除
+# SELECT flower, is_deleted, delete_effect_date
+# FROM product_cost
+# WHERE is_deleted = 1;
