@@ -529,30 +529,49 @@ elif menu == "📊 退款明细":
 
         where_clause = " AND ".join(conditions)
         query = text(f"""
-            SELECT 
-                order_no AS '订单号',
-                flower AS '花型',
-                product_spec AS '商品规格',
-                product_quantity AS '数量',
-                refund_meters AS '退款米数',
-                refund_amount AS '退款金额',
-                after_sale_status AS '售后状态',
-                refund_time AS '退款时间'
-            FROM refund_detail
-            WHERE {where_clause}
-            ORDER BY refund_time DESC
-        """)
+                SELECT 
+                    order_no AS '订单号',
+                    flower AS '花型',
+                    product_spec AS '商品规格',
+                    product_quantity AS '数量',
+                    refund_meters AS '退款米数',
+                    refund_amount AS '退款金额',
+                    after_sale_status AS '售后状态',
+                    refund_time AS '退款时间'
+                FROM refund_detail
+                WHERE {where_clause}
+                ORDER BY refund_time DESC
+            """)
 
         df = pd.read_sql(query, conn, params=params)
+
+        # 🔧 查询总营业额（排除所有退款和取消订单）
+        total_revenue_query = text("""
+                SELECT SUM(merchant_income) 
+                FROM data2026 
+                WHERE DATE(order_time) >= :start 
+                  AND DATE(order_time) <= :end
+                  AND order_status != '已取消'
+                  AND after_sale_status NOT LIKE '%退款成功%'
+            """)
+        total_revenue = conn.execute(
+            total_revenue_query,
+            {"start": start_date, "end": end_date}
+        ).scalar() or 0
+
+        # 🔧 转为 float（避免 Decimal 与 float 运算报错）
+        total_revenue = float(total_revenue)
 
     # 显示统计
     if not df.empty:
         st.subheader(f"📊 共找到 {len(df)} 条退款记录")
         total_meters = df['退款米数'].sum()
         total_amount = df['退款金额'].sum()
+        refund_rate = (total_amount / total_revenue * 100) if total_revenue > 0 else 0
+
         st.metric("总退款米数", f"{total_meters:.2f} 米")
         st.metric("总退款金额", f"{total_amount:.2f} 元",
-                  delta=f"占比 {total_amount / df['退款金额'].sum() * 100:.1f}%")
+                      delta=f"占营业额 {refund_rate:.1f}%")
 
         # 显示表格
         st.dataframe(df, use_container_width=True, height=500)
@@ -567,7 +586,6 @@ elif menu == "📊 退款明细":
         )
     else:
         st.info("没有找到符合条件的退款记录")
-
 
 elif menu == "📦 库存管理":
     st.header("📦 库存管理")
