@@ -171,7 +171,8 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
             cost, meter, express_cost, traffic_cost, profit,
             after_sale_status, order_status
         FROM {orders}
-        WHERE DATE(order_time) = :target_date
+        WHERE DATE(delivery_time) = :target_date
+          AND delivery_time IS NOT NULL
     """)
 
     try:
@@ -677,11 +678,11 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
 def generate_all_missing_reports(orders=orders):
     ensure_output_dir()
     query = text(f"""
-        SELECT DISTINCT DATE(order_time) AS order_date
-        FROM {orders}
-        WHERE order_time IS NOT NULL
-        ORDER BY order_date
-    """)
+            SELECT DISTINCT DATE(delivery_time) AS order_date
+            FROM {orders}
+            WHERE delivery_time IS NOT NULL
+            ORDER BY order_date
+        """)
     with engine.connect() as conn:
         df_dates = pd.read_sql(query, conn)
 
@@ -721,4 +722,4 @@ if __name__ == "__main__":
             generate_daily_report(sys.argv[1], force=True)
     else:
             # 默认生成指定日期的日报（可自行修改日期）
-            generate_daily_report("2026-07-11")
+            generate_daily_report("2026-07-01")

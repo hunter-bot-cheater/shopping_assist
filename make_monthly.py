@@ -422,16 +422,16 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
 
             order_status,
 
-            order_time
+            delivery_time
 
 
         FROM {orders}
 
 
-        WHERE order_time >= :start_date
+        WHERE delivery_time >= :start_date
 
 
-        AND order_time <
+        AND delivery_time <
 
         DATE_ADD(
 
