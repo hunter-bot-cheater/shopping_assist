@@ -50,49 +50,142 @@ def add_stock(flower, qty, reference="手动入库", operator="system", target_d
     with engine.connect() as conn:
         trans = conn.begin()
         try:
-            current = get_current_stock(flower)
-            new_stock = current + qty
+            # ── 第 0 步：读取 target_date 的旧快照值（作为变动前基准） ──
+            old_row = conn.execute(
+                text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+                {"f": flower, "d": target_date}
+            ).fetchone()
 
-            # 1. 更新旧表（实时库存）
+            if old_row is not None:
+                old_snapshot_stock = float(old_row[0])
+            else:
+                # target_date 无快照 → 向前取最近一个快照推算至此日，或用 current_stock 创建
+                prev_row = conn.execute(
+                    text("""
+                        SELECT stock, snapshot_date FROM inventory_snapshot
+                        WHERE flower = :f AND snapshot_date < :d
+                        ORDER BY snapshot_date DESC LIMIT 1
+                    """),
+                    {"f": flower, "d": target_date}
+                ).fetchone()
+                if prev_row:
+                    base_stock = float(prev_row[0])
+                    base_date = prev_row[1]
+                    walk_stock = base_stock
+                    from datetime import timedelta
+                    walk_date = base_date + timedelta(days=1)
+                    while walk_date <= target_date:
+                        ds = float(
+                            conn.execute(
+                                text("SELECT COALESCE(SUM(total_meters), 0) FROM daily_report_cache WHERE report_date = :d AND flower = :f"),
+                                {"d": walk_date, "f": flower}
+                            ).scalar() or 0
+                        )
+                        di = float(
+                            conn.execute(
+                                text("SELECT COALESCE(SUM(change_qty), 0) FROM inventory_log WHERE flower = :f AND change_type = '入库' AND DATE(created_at) = :d"),
+                                {"f": flower, "d": walk_date}
+                            ).scalar() or 0
+                        )
+                        da = float(
+                            conn.execute(
+                                text("SELECT COALESCE(SUM(change_qty), 0) FROM inventory_log WHERE flower = :f AND change_type = '手动调整' AND DATE(created_at) = :d"),
+                                {"f": flower, "d": walk_date}
+                            ).scalar() or 0
+                        )
+                        walk_stock = max(walk_stock - ds + di + da, 0)
+                        walk_date += timedelta(days=1)
+                    old_snapshot_stock = walk_stock
+                else:
+                    # 完全无快照 → 从当前库存反推：当前 - qty
+                    old_snapshot_stock = max(get_current_stock(flower) - qty, 0)
+
+                # 创建 target_date 快照
+                conn.execute(
+                    text("""
+                        INSERT INTO inventory_snapshot (flower, snapshot_date, stock, updated_by, updated_at)
+                        VALUES (:f, :d, :s, :op, CURRENT_TIMESTAMP)
+                    """),
+                    {"f": flower, "d": target_date, "s": old_snapshot_stock, "op": operator}
+                )
+
+            new_snapshot_stock = old_snapshot_stock + qty
+
+            # ── 第 1 步：更新实时库存表 ──
             conn.execute(
-                text("UPDATE inventory SET current_stock = :new WHERE flower = :f"),
-                {"new": new_stock, "f": flower}
+                text("UPDATE inventory SET current_stock = current_stock + :qty WHERE flower = :f"),
+                {"qty": qty, "f": flower}
             )
 
-            # 2. 确保目标日期及之后有快照记录
-            check_snapshot = conn.execute(
-                text("SELECT COUNT(*) FROM inventory_snapshot WHERE flower = :f AND snapshot_date >= :d"),
-                {"f": flower, "d": target_date}
-            ).scalar()
-
-            if check_snapshot == 0:
-                print(f"⚠️ {flower} 从 {target_date} 起没有快照记录，正在补全...")
-                from inventory_service import fill_missing_snapshots
-                fill_missing_snapshots(operator=operator)
-
-            # 3. 🔧 从 target_date 起的所有快照都 +qty，且不低于 0
-            result = conn.execute(
+            # ── 第 2 步：更新 target_date 快照 ──
+            conn.execute(
                 text("""
                     UPDATE inventory_snapshot
-                    SET stock = GREATEST(stock + :qty, 0), updated_by = :op, updated_at = CURRENT_TIMESTAMP
-                    WHERE flower = :f AND snapshot_date >= :d
+                    SET stock = :new, updated_by = :op, updated_at = CURRENT_TIMESTAMP
+                    WHERE flower = :f AND snapshot_date = :d
                 """),
-                {"qty": qty, "op": operator, "f": flower, "d": target_date}
+                {"new": new_snapshot_stock, "op": operator, "f": flower, "d": target_date}
             )
-            print(f"🔍 快照表更新影响行数：{result.rowcount}（从 {target_date} 起）")
 
-            # 4. 写入流水
+            # ── 第 3 步：逐日重算后续日期快照 ──
+            future_dates = conn.execute(
+                text("""
+                    SELECT snapshot_date FROM inventory_snapshot
+                    WHERE flower = :f AND snapshot_date > :d
+                    ORDER BY snapshot_date
+                """),
+                {"f": flower, "d": target_date}
+            ).fetchall()
+
+            current_stock = new_snapshot_stock  # ★ 使用快照值而非 inventory 表值
+            affected = 0
+            for (row_date,) in future_dates:
+                daily_sales = float(
+                    conn.execute(
+                        text("SELECT COALESCE(SUM(total_meters), 0) FROM daily_report_cache WHERE report_date = :d AND flower = :f"),
+                        {"d": row_date, "f": flower}
+                    ).scalar() or 0
+                )
+                daily_inbound = float(
+                    conn.execute(
+                        text("SELECT COALESCE(SUM(change_qty), 0) FROM inventory_log WHERE flower = :f AND change_type = '入库' AND DATE(created_at) = :d"),
+                        {"f": flower, "d": row_date}
+                    ).scalar() or 0
+                )
+                daily_adjust = float(
+                    conn.execute(
+                        text("SELECT COALESCE(SUM(change_qty), 0) FROM inventory_log WHERE flower = :f AND change_type = '手动调整' AND DATE(created_at) = :d"),
+                        {"f": flower, "d": row_date}
+                    ).scalar() or 0
+                )
+                current_stock = max(current_stock - daily_sales + daily_inbound + daily_adjust, 0)
+                conn.execute(
+                    text("""
+                        UPDATE inventory_snapshot
+                        SET stock = :new, updated_by = :op, updated_at = CURRENT_TIMESTAMP
+                        WHERE flower = :f AND snapshot_date = :d
+                    """),
+                    {"new": current_stock, "op": operator, "f": flower, "d": row_date}
+                )
+                affected += 1
+
+            # ── 第 4 步：写入库存流水（用快照值） ──
             conn.execute(
                 text("""
                     INSERT INTO inventory_log
                     (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
                     VALUES (:f, '入库', :qty, :before, :after, :ref, :op)
                 """),
-                {"f": flower, "qty": qty, "before": current, "after": new_stock, "ref": reference, "op": operator}
+                {
+                    "f": flower, "qty": qty,
+                    "before": old_snapshot_stock,
+                    "after": new_snapshot_stock,
+                    "ref": reference, "op": operator
+                }
             )
 
             trans.commit()
-            print(f"✅ 入库成功：{flower} 增加 {qty} 米（当前库存：{new_stock}，生效日期：{target_date}）")
+            print(f"✅ 入库成功：{flower} +{qty} 米（快照 {old_snapshot_stock}→{new_snapshot_stock}，生效 {target_date}，后续重算 {affected} 天）")
 
         except Exception as e:
             trans.rollback()
@@ -147,7 +240,13 @@ def deduct_stock(flower, qty, reference="销售出库", operator="system", repor
                 from inventory_service import fill_missing_snapshots
                 fill_missing_snapshots(operator=operator)
 
-            # 3. 🔧 从 report_date 起的所有快照都 -qty，但不低于 0
+            # 3. 🔧 读取快照旧值（用于日志），然后从 report_date 起所有快照 -qty
+            snap_before_row = conn.execute(
+                text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+                {"f": flower, "d": report_date}
+            ).fetchone()
+            snap_before = float(snap_before_row[0]) if snap_before_row else current
+
             result = conn.execute(
                 text("""
                     UPDATE inventory_snapshot
@@ -158,15 +257,20 @@ def deduct_stock(flower, qty, reference="销售出库", operator="system", repor
             )
             print(f"🔍 快照表更新影响行数：{result.rowcount}（从 {report_date} 起）")
 
-            # 4. 写入流水（记录实际扣减量和结果）
-            actual_deduct = current - new_stock  # 实际扣减量（若库存不足则小于 qty）
+            # 4. 写入流水（用快照值）
+            snap_after = max(snap_before - qty, 0)
+            actual_deduct = snap_before - snap_after
             conn.execute(
                 text("""
                     INSERT INTO inventory_log
                     (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
                     VALUES (:f, '销售出库', :qty, :before, :after, :ref, :op)
                 """),
-                {"f": flower, "qty": -actual_deduct, "before": current, "after": new_stock, "ref": reference, "op": operator}
+                {
+                    "f": flower, "qty": -actual_deduct,
+                    "before": snap_before, "after": snap_after,
+                    "ref": reference, "op": operator
+                }
             )
 
             trans.commit()

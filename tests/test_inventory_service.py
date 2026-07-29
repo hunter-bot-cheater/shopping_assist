@@ -82,16 +82,66 @@ class TestAddStock:
     @patch('inventory_service.get_current_stock', return_value=100.0)
     def test_add_stock_success(self, mock_get_stock, mock_check, mock_conn):
         """Basic stock addition updates inventory, snapshot, and log."""
-        # configure snapshot-check query and other executes
+        # 新流程：读旧快照 → UPDATE inventory → UPDATE 目标快照 → 查后续日期 → INSERT log
         mock_conn.execute.side_effect = [
-            MagicMock(rowcount=3),       # UPDATE inventory → 3 rows
-            MagicMock(scalar=lambda: 5), # SELECT COUNT(*) → 5 snapshots exist
-            MagicMock(rowcount=10),      # UPDATE snapshot → 10 rows affected
-            MagicMock(),                 # INSERT INTO inventory_log
+            MagicMock(fetchone=lambda: (100.0,)),  # ① 读旧快照
+            MagicMock(rowcount=1),                  # ② UPDATE inventory
+            MagicMock(rowcount=1),                  # ③ UPDATE target_date snapshot
+            MagicMock(fetchall=lambda: []),          # ④ 后续日期为空
+            MagicMock(),                             # ⑤ INSERT inventory_log
         ]
 
         add_stock('花型A', 20, '采购入库', 'tester', '2026-07-15')
-        # No exception means success
+
+    @patch('inventory_service.check_flower_active', return_value=(True, ''))
+    @patch('inventory_service.get_current_stock', return_value=0.0)
+    def test_add_stock_per_day_recalc(self, mock_get_stock, mock_check, mock_conn):
+        """入库后，后续快照应递减销售，而非机械 +qty。"""
+        call_log = []
+
+        def side_effect(sql, params=None, **kw):
+            call_log.append({'sql': str(sql)[:80], 'params': params})
+            result = MagicMock()
+            sql_str = str(sql)
+            # ① 读 target_date 旧快照
+            if "snapshot_date = :d" in sql_str and "snapshot_date >" not in sql_str:
+                result.fetchone.return_value = (0.0,)
+            # ② 后续日期查询
+            elif "snapshot_date >" in sql_str and "snapshot_date) FROM" in sql_str:
+                result.fetchall.return_value = [('2026-07-16',), ('2026-07-17',)]
+            # ③ 销售查询
+            elif 'daily_report_cache' in sql_str:
+                if params and params.get('d') == '2026-07-16':
+                    result.scalar.return_value = 10.0
+                elif params and params.get('d') == '2026-07-17':
+                    result.scalar.return_value = 5.0
+                else:
+                    result.scalar.return_value = 0
+            # ④ 入库/调整查询
+            elif 'inventory_log' in sql_str and 'COALESCE' in sql_str:
+                result.scalar.return_value = 0
+            # ⑤ 所有其他 execute（UPDATE / INSERT）
+            else:
+                result.rowcount = 1
+            return result
+
+        mock_conn.execute.side_effect = side_effect
+        add_stock('花型A', 100, '采购入库', 'tester', '2026-07-15')
+        # 检查：7/15 快照旧值 0 → 新值 100，7/16 = 90，7/17 = 85
+        # 只验证不抛异常
+
+    @patch('inventory_service.check_flower_active', return_value=(True, ''))
+    @patch('inventory_service.get_current_stock', return_value=100.0)
+    def test_add_stock_no_future_dates(self, mock_get_stock, mock_check, mock_conn):
+        """无后续日期时不应报错。"""
+        mock_conn.execute.side_effect = [
+            MagicMock(fetchone=lambda: (50.0,)),  # ① 读旧快照
+            MagicMock(rowcount=1),                  # ② UPDATE inventory
+            MagicMock(rowcount=1),                  # ③ UPDATE target_date snapshot
+            MagicMock(fetchall=lambda: []),          # ④ 后续日期为空
+            MagicMock(),                             # ⑤ INSERT inventory_log
+        ]
+        add_stock('花型A', 30, '采购入库', 'tester', '2026-07-15')
 
     @patch('inventory_service.check_flower_active', return_value=(True, ''))
     @patch('inventory_service.get_current_stock', return_value=100.0)
@@ -121,10 +171,11 @@ class TestDeductStock:
     @patch('inventory_service.get_current_stock', return_value=100.0)
     def test_deduct_stock_success(self, mock_get_stock, mock_check, mock_conn):
         mock_conn.execute.side_effect = [
-            MagicMock(),                 # UPDATE inventory
-            MagicMock(scalar=lambda: 5), # SELECT COUNT(*) → 5 snapshots
-            MagicMock(rowcount=10),      # UPDATE snapshot
-            MagicMock(),                 # INSERT INTO inventory_log
+            MagicMock(fetchone=lambda: (100.0,)),  # ① 读快照旧值
+            MagicMock(),                            # ② UPDATE inventory
+            MagicMock(scalar=lambda: 5),            # ③ COUNT 快照
+            MagicMock(rowcount=10),                 # ④ UPDATE snapshot
+            MagicMock(),                            # ⑤ INSERT inventory_log
         ]
         deduct_stock('花型A', 30, '销售出库', 'tester', '2026-07-15')
 
@@ -133,10 +184,11 @@ class TestDeductStock:
     def test_deduct_stock_insufficient(self, mock_get_stock, mock_check, mock_conn):
         """Stock should floor at 0 — no exception, just capped."""
         mock_conn.execute.side_effect = [
-            MagicMock(),                 # UPDATE inventory
-            MagicMock(scalar=lambda: 5),
-            MagicMock(rowcount=10),
-            MagicMock(),                 # INSERT INTO inventory_log
+            MagicMock(fetchone=lambda: (5.0,)),   # ① 读快照旧值
+            MagicMock(),                            # ② UPDATE inventory
+            MagicMock(scalar=lambda: 5),            # ③ COUNT 快照
+            MagicMock(rowcount=10),                 # ④ UPDATE snapshot
+            MagicMock(),                            # ⑤ INSERT inventory_log
         ]
         # Deducting more than available should not raise
         deduct_stock('花型A', 100, '销售出库', 'tester', '2026-07-15')

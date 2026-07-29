@@ -477,81 +477,87 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
         print(f"⚠️ {target_date} 当前无正常订单，旧数据已被清除")
 
     # ============================================================
-    # 🔧 增量扣减库存（只扣减新增的订单量，避免重复扣减）
+    # 🔧 回退旧扣减 + 重新扣减库存（不依赖 inventory_log）
     # ============================================================
+    # 第 1 步：根据旧缓存数据回退上一次日报的扣减
+    if old_data:
+        rollback_count = 0
+        with engine.connect() as conn:
+            trans = conn.begin()
+            for flower, data in old_data.items():
+                prev_meters = float(data.get('total_meters', 0))
+                if prev_meters <= 0.001:
+                    continue
+                # 读回退前快照值
+                before_row = conn.execute(
+                    text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+                    {"f": flower, "d": target_date}
+                ).fetchone()
+                before_stock = float(before_row[0]) if before_row else 0
+
+                # 回退实时库存
+                conn.execute(
+                    text("UPDATE inventory SET current_stock = current_stock + :qty WHERE flower = :f"),
+                    {"qty": prev_meters, "f": flower}
+                )
+                # 回退快照（从 target_date 起所有快照 +prev_meters）
+                conn.execute(
+                    text("""
+                        UPDATE inventory_snapshot
+                        SET stock = stock + :qty, updated_by = 'system', updated_at = CURRENT_TIMESTAMP
+                        WHERE flower = :f AND snapshot_date >= :d
+                    """),
+                    {"qty": prev_meters, "f": flower, "d": target_date}
+                )
+                # 写入回退日志
+                conn.execute(
+                    text("""
+                        INSERT INTO inventory_log
+                        (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
+                        VALUES (:f, '手动调整', :qty, :before, :after, :ref, :op)
+                    """),
+                    {
+                        "f": flower, "qty": prev_meters,
+                        "before": before_stock,
+                        "after": before_stock + prev_meters,
+                        "ref": f"回退日报 {target_date}（重新生成）",
+                        "op": "system"
+                    }
+                )
+                rollback_count += 1
+            trans.commit()
+        if rollback_count > 0:
+            print(f"🔄 已回退 {rollback_count} 个花型的旧扣减")
+
+    # 第 2 步：按新日报重新扣减
     if not normal_df.empty:
         sales_summary = normal_df.groupby('花型')['米数'].sum().reset_index()
-
-        # 1. 查询该日期之前已扣减的库存量
-        prev_deducted = {}  # {flower: already_deducted_qty}
-        with engine.connect() as conn:
-            prev_logs = conn.execute(
-                text("""
-                    SELECT flower, SUM(ABS(change_qty)) as deducted_qty
-                    FROM inventory_log
-                    WHERE change_type = '销售出库'
-                      AND reference LIKE :ref_pattern
-                    GROUP BY flower
-                """),
-                {"ref_pattern": f"日报自动扣减 %{target_date}%"}
-            ).fetchall()
-            prev_deducted = {row[0]: float(row[1]) for row in prev_logs}
-
-            # ★ 修复：查询回退记录，从 prev_deducted 中扣除已回退的部分
-            rollback_logs = conn.execute(
-                text("""
-                    SELECT flower, SUM(change_qty) as rollback_qty
-                    FROM inventory_log
-                    WHERE change_type = '手动调整'
-                      AND reference LIKE :ref_pattern
-                    GROUP BY flower
-                """),
-                {"ref_pattern": f"回退日报 %{target_date}%"}
-            ).fetchall()
-            for row in rollback_logs:
-                flower = row[0]
-                rollback_qty = float(row[1])  # 正数（加回库存）
-                if flower in prev_deducted:
-                    prev_deducted[flower] = max(prev_deducted[flower] - rollback_qty, 0)
-                    print(f"  🔄 {flower}: 已回退 {rollback_qty} 米，调整后已扣量 {prev_deducted[flower]:.1f}")
-
-        if prev_deducted:
-            print(f"📋 该日期已扣减过 {len(prev_deducted)} 个花型，仅扣减增量部分")
-
-        # 2. 计算增量并只扣减新增部分
         print("\n📦 正在扣减库存...")
         deducted_count = 0
-        skipped_count = 0
         for _, row in sales_summary.iterrows():
             flower = row['花型']
             current_meters = float(row['米数'])
-            prev_meters = prev_deducted.get(flower, 0)
-            delta = current_meters - prev_meters
-
-            if delta <= 0.001:
-                # 已扣减过，且无新增，跳过
-                if prev_meters > 0:
-                    skipped_count += 1
+            if current_meters <= 0.001:
                 continue
-
-            # 只扣减增量部分
             try:
                 deduct_stock(
                     flower=flower,
-                    qty=delta,
+                    qty=current_meters,
                     reference=f"日报自动扣减 {target_date}",
                     operator="system",
                     report_date=target_date
                 )
                 deducted_count += 1
-                print(f"  ✅ {flower}: 新增 {delta:.1f} 米（总计 {current_meters:.1f}，已扣 {prev_meters:.1f}）")
+                print(f"  ✅ {flower}: 扣减 {current_meters:.1f} 米")
             except ValueError as e:
                 print(f"  ⚠️ {e}，跳过该花型")
 
-        if deducted_count > 0 or skipped_count > 0:
-            print(f"✅ 库存扣减完成：{deducted_count} 个花型新增扣减，{skipped_count} 个花型无变化跳过")
+        if deducted_count > 0:
+            print(f"✅ 库存扣减完成：{deducted_count} 个花型")
         else:
-            print("ℹ️ 无需扣减（所有花型已扣减且无新增订单）")
+            print("ℹ️ 没有需要扣减的花型")
+    elif not old_data:
+        print("ℹ️ 无旧数据且无新订单，无需库存变动")
 
     # ============================================================
     # 查询缺口
