@@ -30,13 +30,11 @@ jobs:
 
       - name: Create temporary config.py (CI placeholder)
         run: |
-          cat > config.py << 'EOF'
-MYSQL_USER="ci"
-MYSQL_PASSWORD="ci"
-MYSQL_HOST="localhost"
-MYSQL_PORT="3306"
-MYSQL_DATABASE="shop_data"
-EOF
+          echo 'MYSQL_USER="ci"' > config.py
+          echo 'MYSQL_PASSWORD="ci"' >> config.py
+          echo 'MYSQL_HOST="localhost"' >> config.py
+          echo 'MYSQL_PORT="3306"' >> config.py
+          echo 'MYSQL_DATABASE="shop_data"' >> config.py
 
       - name: Run tests with coverage and fail if coverage < 55%
         run: |
