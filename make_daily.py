@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import text
 from mysql_conn import engine
 from import_order import orders
-from inventory_service import deduct_stock, add_stock, get_inventory_report, rollback_daily_sales,get_missing_report_dates
+from inventory_service import deduct_stock, get_missing_report_dates
 
 # ============================
 # 配置
@@ -109,7 +109,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     filepath = os.path.join(OUTPUT_DIR, filename)
 
     # ============================================================
-    # 🔧 修复：强制覆盖模式 - 先读取旧数据，再回退库存，最后删除缓存
+    # 🔧 改进：读取旧缓存用于对比，但不回退库存（改用增量扣减）
     # ============================================================
     old_data = None
     with engine.connect() as conn:
@@ -134,15 +134,8 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
             old_data = {}
             print(f"📝 {target_date} 首次生成日报")
 
-        # 2. 🔧 关键修复：先回退旧库存（无论是否有缓存）
-        print(f"🔄 正在回退 {target_date} 的旧库存变动...")
-        count, success, msg = rollback_daily_sales(target_date, operator="system")
-        if not success:
-            raise Exception(f"❌ 回退失败：{msg}")
-        if count > 0:
-            print(f"✅ 已回退 {count} 条销售出库记录")
-        else:
-            print(f"ℹ️ 没有需要回退的记录")
+        # 2. 🔧 不再自动回退库存，改为增量扣减（见下方扣减逻辑）
+        # 只清理缓存数据，库存变动记录保留用于增量计算
 
         # 3. 删除所有旧缓存（确保插入时不会唯一键冲突）
         conn.execute(
@@ -475,26 +468,63 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
         print(f"⚠️ {target_date} 当前无正常订单，旧数据已被清除")
 
     # ============================================================
-    # 自动扣减库存
+    # 🔧 增量扣减库存（只扣减新增的订单量，避免重复扣减）
     # ============================================================
     if not normal_df.empty:
         sales_summary = normal_df.groupby('花型')['米数'].sum().reset_index()
+
+        # 1. 查询该日期之前已扣减的库存量
+        prev_deducted = {}  # {flower: already_deducted_qty}
+        with engine.connect() as conn:
+            prev_logs = conn.execute(
+                text("""
+                    SELECT flower, SUM(ABS(change_qty)) as deducted_qty
+                    FROM inventory_log
+                    WHERE change_type = '销售出库'
+                      AND reference LIKE :ref_pattern
+                    GROUP BY flower
+                """),
+                {"ref_pattern": f"日报自动扣减 %{target_date}%"}
+            ).fetchall()
+            prev_deducted = {row[0]: float(row[1]) for row in prev_logs}
+
+        if prev_deducted:
+            print(f"📋 该日期已扣减过 {len(prev_deducted)} 个花型，仅扣减增量部分")
+
+        # 2. 计算增量并只扣减新增部分
         print("\n📦 正在扣减库存...")
+        deducted_count = 0
+        skipped_count = 0
         for _, row in sales_summary.iterrows():
             flower = row['花型']
-            meters = float(row['米数'])
-            if meters > 0:
-                try:
-                    deduct_stock(
-                        flower=flower,
-                        qty=meters,
-                        reference=f"日报自动扣减 {target_date}",
-                        operator="system",
-                        report_date=target_date
-                    )
-                except ValueError as e:
-                    print(f"⚠️ {e}，跳过该花型")
-        print("✅ 库存扣减完成")
+            current_meters = float(row['米数'])
+            prev_meters = prev_deducted.get(flower, 0)
+            delta = current_meters - prev_meters
+
+            if delta <= 0.001:
+                # 已扣减过，且无新增，跳过
+                if prev_meters > 0:
+                    skipped_count += 1
+                continue
+
+            # 只扣减增量部分
+            try:
+                deduct_stock(
+                    flower=flower,
+                    qty=delta,
+                    reference=f"日报自动扣减 {target_date}",
+                    operator="system",
+                    report_date=target_date
+                )
+                deducted_count += 1
+                print(f"  ✅ {flower}: 新增 {delta:.1f} 米（总计 {current_meters:.1f}，已扣 {prev_meters:.1f}）")
+            except ValueError as e:
+                print(f"  ⚠️ {e}，跳过该花型")
+
+        if deducted_count > 0 or skipped_count > 0:
+            print(f"✅ 库存扣减完成：{deducted_count} 个花型新增扣减，{skipped_count} 个花型无变化跳过")
+        else:
+            print("ℹ️ 无需扣减（所有花型已扣减且无新增订单）")
 
     # ============================================================
     # 查询缺口

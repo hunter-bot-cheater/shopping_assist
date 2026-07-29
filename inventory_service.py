@@ -951,6 +951,98 @@ def get_missing_report_dates():
         # 缺失日报 = 有订单但没生成日报
         missing = [d for d in order_dates_set if d not in report_dates_set]
         return sorted(missing)
+
+
+# =============================================
+# 拿货建议：基于近7天销量 + 当前库存，建议每种花型拿多少米
+# =============================================
+def get_restock_suggestions(target_days=7):
+    """
+    获取所有花型的拿货建议，按紧急程度排序。
+
+    算法：
+    - 近7天日均销量 = AVG(daily_report_cache.total_meters) over last 7 days
+    - 当前库存 = 最新快照库存
+    - 可售天数 = 当前库存 / 日均销量（日均销量=0 则为 ∞）
+    - 建议拿货 = max(0, 日均销量 × target_days - 当前库存)，向上取整到 0.5 米
+
+    排序：可售天数升序 → 日均销量降序（最紧急的排最前）
+
+    返回 DataFrame 列：
+    ['花型', '当前库存(米)', '近7天日均销量', '可售天数', '建议拿货(米)']
+    """
+    from add_del_flower import get_available_flowers
+    import math
+
+    # 获取可用花型（未删除的）
+    available_df = get_available_flowers()
+    if available_df.empty:
+        return pd.DataFrame(columns=['花型', '当前库存(米)', '近7天日均销量', '可售天数', '建议拿货(米)'])
+
+    available_flowers = available_df['flower'].tolist()
+
+    # 获取最新快照日期
+    latest_date = get_latest_snapshot_date()
+    if not latest_date:
+        return pd.DataFrame(columns=['花型', '当前库存(米)', '近7天日均销量', '可售天数', '建议拿货(米)'])
+
+    # 获取当前库存
+    inv_df = get_inventory_snapshot(latest_date)
+    if inv_df.empty:
+        return pd.DataFrame(columns=['花型', '当前库存(米)', '近7天日均销量', '可售天数', '建议拿货(米)'])
+
+    # 只保留可用花型
+    inv_df = inv_df[inv_df['花型'].isin(available_flowers)].copy()
+
+    # 获取近7天日均销量（基于日报缓存）
+    with engine.connect() as conn:
+        avg_sales = pd.read_sql(
+            text("""
+                SELECT flower, AVG(total_meters) as avg_daily
+                FROM daily_report_cache
+                WHERE report_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+                GROUP BY flower
+            """),
+            conn
+        )
+    avg_map = dict(zip(avg_sales['flower'], avg_sales['avg_daily']))
+
+    # 计算各指标
+    inv_df['近7天日均销量'] = inv_df['花型'].apply(lambda x: round(avg_map.get(x, 0), 2))
+    inv_df['可售天数_raw'] = inv_df.apply(
+        lambda row: row['库存'] / row['近7天日均销量'] if row['近7天日均销量'] > 0 else float('inf'),
+        axis=1
+    )
+
+    # 建议拿货量：max(0, 日均销量 × target_days - 当前库存)，向上取整到 0.5
+    def calc_suggest(row):
+        if row['近7天日均销量'] <= 0:
+            return 0.0
+        need = row['近7天日均销量'] * target_days - row['库存']
+        if need <= 0:
+            return 0.0
+        # 向上取整到 0.5
+        return math.ceil(need * 2) / 2
+
+    inv_df['建议拿货(米)'] = inv_df.apply(calc_suggest, axis=1)
+
+    # 可售天数格式化：∞ 显示为 None，方便排序
+    inv_df['可售天数'] = inv_df['可售天数_raw'].apply(
+        lambda x: round(x, 1) if x != float('inf') else None
+    )
+
+    # 排序：可售天数升序（None 排最后），日均销量降序
+    inv_df['_sort_days'] = inv_df['可售天数_raw'].apply(lambda x: x if x != float('inf') else 999999)
+    inv_df = inv_df.sort_values(['_sort_days', '近7天日均销量'], ascending=[True, False])
+
+    # 重命名列
+    result = inv_df[['花型', '库存', '近7天日均销量', '可售天数', '建议拿货(米)']].copy()
+    result = result.rename(columns={'库存': '当前库存(米)'})
+    result = result.reset_index(drop=True)
+
+    return result
+
+
 def check_flower_active(flower):
     """检查花型是否可用（未删除）"""
     with engine.connect() as conn:
