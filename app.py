@@ -179,6 +179,51 @@ elif menu == "📤 导入订单":
                             st.subheader("📊 导入统计")
                             st.json(result["stats"])
 
+                            # 🔧 显示订单变化（重点标注利润影响）
+                            changes = result.get("changes")
+                            if changes and changes.get("changes") is not None and not changes["changes"].empty:
+                                st.divider()
+                                ch_summary = changes["summary"]
+                                st.subheader("🔍 订单变化检测")
+
+                                col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+                                with col_c1:
+                                    st.metric("🆕 新订单", ch_summary.get("new_orders", 0))
+                                with col_c2:
+                                    st.metric("📝 变更订单", ch_summary.get("changed_orders", 0))
+                                with col_c3:
+                                    st.metric("✅ 无变化", ch_summary.get("unchanged_orders", 0))
+                                with col_c4:
+                                    important = ch_summary.get("important_changes", 0)
+                                    st.metric("🔴 重要变化", important,
+                                              delta="需关注" if important > 0 else None)
+
+
+
+                                ch_df = changes["changes"]
+                                # 样式着色
+                                def color_changes(row):
+                                    if row['重要程度'] == '🔴 重要':
+                                        return ['background-color: #ffe0e0'] * len(row)
+                                    elif row['重要程度'] == '🟡 关注':
+                                        return ['background-color: #fff3cd'] * len(row)
+                                    elif row['变化类型'] == '🆕 新订单':
+                                        return ['background-color: #e0f0ff'] * len(row)
+                                    return [''] * len(row)
+
+                                st.dataframe(
+                                    ch_df.style.apply(color_changes, axis=1),
+                                    use_container_width=True,
+                                    height=300
+                                )
+                                st.caption(
+                                    "🔴 红色 = 影响利润的重要变化（状态/金额） | "
+                                    "🟡 黄色 = 需关注（数量/规格） | "
+                                    "🔵 蓝色 = 新订单"
+                                )
+                            elif changes and changes.get("changes") is not None and changes["changes"].empty:
+                                st.info("📋 所有订单数据与数据库一致，无变化")
+
                             # 同步退款明细
                             st.info("🔄 正在同步退款明细...")
                             try:
