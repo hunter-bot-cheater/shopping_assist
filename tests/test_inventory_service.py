@@ -189,9 +189,29 @@ class TestRollbackDailySales:
 class TestUpdateInventorySnapshot:
 
     def test_update_success(self, mock_conn):
-        """Change from 100 to 150 should apply +50 delta to all later dates."""
-        mock_conn.execute.return_value.fetchone.return_value = (100.0,)
-        mock_conn.execute.return_value.rowcount = 5  # affected 5 subsequent days
+        """Change from 100 to 150 should recalculate from new stock base."""
+        from datetime import date, timedelta
+        base = date(2026, 7, 15)
+        future_dates = [(base + timedelta(days=i),) for i in range(1, 6)]
+
+        call_log = []
+
+        def side_effect(sql, params=None, **kw):
+            call_log.append({'sql': str(sql)[:60], 'params': params})
+            result = MagicMock()
+            sql_str = str(sql)
+            # First call: old stock query
+            if 'SELECT stock FROM inventory_snapshot' in sql_str and 'snapshot_date = :d' in sql_str:
+                result.fetchone.return_value = (100.0,)
+            # Third call: future dates query
+            elif 'SELECT snapshot_date FROM inventory_snapshot' in sql_str:
+                result.fetchall.return_value = future_dates
+            # All scalar queries (sales, inbound, adjust) return 0
+            else:
+                result.scalar.return_value = 0
+            return result
+
+        mock_conn.execute.side_effect = side_effect
 
         ok, msg, affected = update_inventory_snapshot(
             '花型A', '2026-07-15', 150, operator='tester', reason='盘点调整'
