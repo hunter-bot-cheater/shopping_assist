@@ -256,7 +256,15 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
                 "stats": {}
             }
 
-        # 2. 按字段映射重命名
+        # 2. 检查 DataFrame 是否为空
+        if df.empty:
+            return {
+                "success": False,
+                "message": "导入的数据为空",
+                "stats": {}
+            }
+
+        # 3. 按字段映射重命名
         existing_cols = [col for col in COLUMN_MAPPING.keys() if col in df.columns]
         df = df[existing_cols]
         df = df.rename(columns=COLUMN_MAPPING)

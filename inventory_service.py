@@ -233,6 +233,19 @@ def rollback_daily_sales(target_date, operator="system"):
                     {"new": target_stock, "f": flower}
                 )
 
+                # ★ 修复：同步回退 inventory_snapshot（change_qty 为负数，减负数=加回）
+                result_snap = conn.execute(
+                    text("""
+                        UPDATE inventory_snapshot
+                        SET stock = GREATEST(stock - :qty, 0),
+                            updated_by = :op,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE flower = :f AND snapshot_date >= :d
+                    """),
+                    {"qty": change_qty, "op": operator, "f": flower, "d": target_date}
+                )
+                print(f"🔍 快照表回退影响行数：{result_snap.rowcount}（从 {target_date} 起，花型 {flower}）")
+
                 conn.execute(
                     text("""
                         INSERT INTO inventory_log
@@ -723,12 +736,8 @@ def fill_missing_snapshots(up_to_date=None, operator='system'):
 
                 conn.execute(
                     text("""
-                        INSERT INTO inventory_snapshot (flower, snapshot_date, stock, updated_by)
+                        INSERT IGNORE INTO inventory_snapshot (flower, snapshot_date, stock, updated_by)
                         VALUES (:f, :d, :stock, :op)
-                        ON DUPLICATE KEY UPDATE
-                            stock = VALUES(stock),
-                            updated_by = VALUES(updated_by),
-                            updated_at = CURRENT_TIMESTAMP
                     """),
                     {"f": flower, "d": current, "stock": stock, "op": operator}
                 )

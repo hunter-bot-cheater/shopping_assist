@@ -1,0 +1,11 @@
+[run]
+omit =
+    app.py
+    config.py
+    mysql_conn.py
+    import_flower.py
+    init_inventory.py
+    make_cost_table.py
+    make_monthly.py
+    tests/*
+    .github/*

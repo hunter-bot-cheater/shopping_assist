@@ -44,6 +44,14 @@ def extract_meter_from_spec(spec):
     if pd.isna(spec):
         return 0
     spec = str(spec).strip()
+    # 全角字符转半角（处理中文输入法产生的全角标点和数字）
+    full_to_half = str.maketrans({
+        '，': ',', '．': '.', '（': '(', '）': ')',
+        '０': '0', '１': '1', '２': '2', '３': '3', '４': '4',
+        '５': '5', '６': '6', '７': '7', '８': '8', '９': '9',
+    })
+    spec = spec.translate(full_to_half)
+
     # 只取逗号前内容
     first_part = spec.split(',')[1] if ',' in spec else spec
     first_part = re.split(r'[（(]', first_part)[0]
@@ -487,6 +495,24 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
                 {"ref_pattern": f"日报自动扣减 %{target_date}%"}
             ).fetchall()
             prev_deducted = {row[0]: float(row[1]) for row in prev_logs}
+
+            # ★ 修复：查询回退记录，从 prev_deducted 中扣除已回退的部分
+            rollback_logs = conn.execute(
+                text("""
+                    SELECT flower, SUM(change_qty) as rollback_qty
+                    FROM inventory_log
+                    WHERE change_type = '手动调整'
+                      AND reference LIKE :ref_pattern
+                    GROUP BY flower
+                """),
+                {"ref_pattern": f"回退日报 %{target_date}%"}
+            ).fetchall()
+            for row in rollback_logs:
+                flower = row[0]
+                rollback_qty = float(row[1])  # 正数（加回库存）
+                if flower in prev_deducted:
+                    prev_deducted[flower] = max(prev_deducted[flower] - rollback_qty, 0)
+                    print(f"  🔄 {flower}: 已回退 {rollback_qty} 米，调整后已扣量 {prev_deducted[flower]:.1f}")
 
         if prev_deducted:
             print(f"📋 该日期已扣减过 {len(prev_deducted)} 个花型，仅扣减增量部分")

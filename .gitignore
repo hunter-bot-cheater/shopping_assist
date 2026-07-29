@@ -1,5 +1,14 @@
 多人协作开发操作手册.md
 
+#.coverage相关
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+tests/.coverage
+
+fix_snapshot_repair.sql
+
 
 # ============================================================
 # Python 相关
