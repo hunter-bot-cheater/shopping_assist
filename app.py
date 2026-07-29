@@ -130,12 +130,6 @@ if menu == "🏠 首页":
     else:
         st.success("✅ 库存快照完整")
 
-    # 最近修改记录
-    recent = sys_status.get('recent_changes')
-    if recent is not None and not recent.empty:
-        st.subheader("📝 最近库存修改记录")
-        st.dataframe(recent, use_container_width=True)
-
 
 elif menu == "📤 导入订单":
     st.header("📤 导入订单 Excel")
