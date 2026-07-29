@@ -283,7 +283,20 @@ elif menu == "📥 入库登记":
             else:
                 try:
                     add_stock(flower, qty, ref or "手动入库", operator, target_date=str(stock_date))
-                    st.toast(f"✅ {flower} 入库 {qty} 米成功！（生效日期：{stock_date}）")
+                    # 获取快照表最新日期
+                    from inventory_service import get_latest_snapshot_date, get_inventory_snapshot
+
+                    latest_date = get_latest_snapshot_date()
+                    if latest_date:
+                        # 获取该花型在最新日期的快照
+                        df_snap = get_inventory_snapshot(latest_date, flower=flower)
+                        if not df_snap.empty:
+                            new_snapshot_stock = df_snap.loc[0, '库存']
+                            st.toast(f"✅ {flower} 入库 {qty} 米成功！当前库存（快照）：{new_snapshot_stock:.1f} 米")
+                        else:
+                            st.toast(f"✅ {flower} 入库 {qty} 米成功！")
+                    else:
+                        st.toast(f"✅ {flower} 入库 {qty} 米成功！")
                     st.balloons()
                 except Exception as e:
                     st.error(f"❌ 入库失败：{e}")
@@ -321,10 +334,21 @@ elif menu == "📤 出库登记":
             else:
                 try:
                     deduct_stock(flower, qty, f"手工出库 {ref_date}", operator, str(ref_date))
-                    # 显示当前库存
-                    from inventory_service import get_current_stock
-                    current = get_current_stock(flower)
-                    st.toast(f"✅ {flower} 出库 {qty} 米成功！当前库存：{current} 米")
+
+                    # 🔧 从快照表获取最新库存（与库存管理页面一致）
+                    from inventory_service import get_latest_snapshot_date, get_inventory_snapshot
+
+                    latest_date = get_latest_snapshot_date()
+                    if latest_date:
+                        df_snap = get_inventory_snapshot(latest_date, flower=flower)
+                        if not df_snap.empty:
+                            new_snapshot_stock = df_snap.iloc[0]['库存']
+                            st.toast(f"✅ {flower} 出库 {qty} 米成功！（最新库存：{new_snapshot_stock:.1f} 米）")
+                        else:
+                            st.toast(f"✅ {flower} 出库 {qty} 米成功！")
+                    else:
+                        st.toast(f"✅ {flower} 出库 {qty} 米成功！")
+
                     st.balloons()
                 except Exception as e:
                     st.error(f"❌ 出库失败：{e}")

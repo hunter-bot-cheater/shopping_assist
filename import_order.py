@@ -238,12 +238,204 @@ def import_excel(file_path=None):
 # 定义表对象（用于反射，但用 text 可省去）
 # 为了简化，我们直接使用上面 text 方式。
 # ============================
+# 订单变化检测（导入前对比新旧数据）
+# ============================
+def detect_order_changes(df):
+    """
+    检测导入数据相对于数据库的变化，重点关注影响利润的变动。
+    返回: dict {
+        "changes": DataFrame (变化明细),
+        "summary": dict (统计摘要)
+    }
+    """
+    PROFIT_FIELDS = {
+        'order_status': '订单状态',
+        'after_sale_status': '售后状态',
+        'merchant_income': '商家实收金额',
+        'product_quantity': '商品数量',
+        'product_spec': '商品规格',
+        'product_total': '商品总价',
+        'postage': '邮费',
+        'shop_discount': '店铺优惠折扣',
+        'platform_discount': '平台优惠折扣',
+        'user_payment': '用户实付金额',
+    }
+
+    new_order_nos = df['order_no'].dropna().unique().tolist()
+    if not new_order_nos:
+        return {"changes": pd.DataFrame(), "summary": {"new_orders": 0, "changed_orders": 0, "unchanged_orders": 0, "important_changes": 0}}
+
+    # 查询数据库中已有数据
+    with engine.connect() as conn:
+        existing_rows = []
+        batch_size = 500
+        for i in range(0, len(new_order_nos), batch_size):
+            batch = new_order_nos[i:i+batch_size]
+            placeholders = ','.join([f"'{o}'" for o in batch])
+            sql = f"""
+                SELECT order_no, order_status, after_sale_status, merchant_income,
+                       product_quantity, product_spec, product_total, postage,
+                       shop_discount, platform_discount, user_payment
+                FROM {orders}
+                WHERE order_no IN ({placeholders})
+            """
+            result = conn.execute(text(sql)).fetchall()
+            existing_rows.extend(result)
+
+    old_data = {}
+    for row in existing_rows:
+        old_data[row[0]] = {
+            'order_status': row[1],
+            'after_sale_status': row[2],
+            'merchant_income': float(row[3]) if row[3] is not None else None,
+            'product_quantity': int(row[4]) if row[4] is not None else None,
+            'product_spec': row[5],
+            'product_total': float(row[6]) if row[6] is not None else None,
+            'postage': float(row[7]) if row[7] is not None else None,
+            'shop_discount': float(row[8]) if row[8] is not None else None,
+            'platform_discount': float(row[9]) if row[9] is not None else None,
+            'user_payment': float(row[10]) if row[10] is not None else None,
+        }
+
+    changes_list = []
+    for _, new_row in df.iterrows():
+        order_no = new_row['order_no']
+        if pd.isna(order_no):
+            continue
+        old = old_data.get(order_no)
+        product_name = str(new_row.get('product', ''))[:30]
+
+        if old is None:
+            new_income = float(new_row.get('merchant_income', 0) or 0)
+            changes_list.append({
+                '订单号': order_no,
+                '商品': product_name,
+                '变化类型': '🆕 新订单',
+                '变化字段': '-',
+                '旧值': '-',
+                '新值': '-',
+                '利润影响': f'+{new_income:.2f} 元' if new_income > 0 else '无',
+                '重要程度': '🟢 普通' if new_income > 0 else '⚪ 无影响',
+            })
+            continue
+
+        for field_key, field_label in PROFIT_FIELDS.items():
+            old_val = old.get(field_key)
+            new_val_raw = new_row.get(field_key)
+
+            if pd.isna(new_val_raw):
+                new_val = None
+            elif field_key in ('merchant_income', 'product_total', 'postage',
+                               'shop_discount', 'platform_discount', 'user_payment'):
+                try:
+                    new_val = float(new_val_raw)
+                except (ValueError, TypeError):
+                    new_val = None
+            elif field_key == 'product_quantity':
+                try:
+                    new_val = int(float(new_val_raw))
+                except (ValueError, TypeError):
+                    new_val = None
+            else:
+                new_val = str(new_val_raw) if new_val_raw is not None else None
+
+            if old_val == new_val:
+                continue
+
+            # 计算利润影响
+            profit_impact = _calc_profit_impact(field_key, old_val, new_val, old, new_row)
+
+            if field_key in ('order_status', 'after_sale_status', 'merchant_income'):
+                importance = '🔴 重要'
+            elif field_key in ('product_quantity', 'product_spec'):
+                importance = '🟡 关注'
+            else:
+                importance = '🟢 普通'
+
+            old_display = str(old_val)[:50] if old_val is not None else '（空）'
+            if isinstance(old_val, float):
+                old_display = f'{old_val:.2f}'
+
+            new_display = str(new_val)[:50] if new_val is not None else '（空）'
+            if isinstance(new_val, float):
+                new_display = f'{new_val:.2f}'
+
+            changes_list.append({
+                '订单号': order_no,
+                '商品': product_name,
+                '变化类型': '📝 变更',
+                '变化字段': field_label,
+                '旧值': old_display,
+                '新值': new_display,
+                '利润影响': profit_impact,
+                '重要程度': importance,
+            })
+
+    changes_df = pd.DataFrame(changes_list) if changes_list else pd.DataFrame()
+
+    if not changes_df.empty:
+        new_count = len(changes_df[changes_df['变化类型'] == '🆕 新订单']['订单号'].unique())
+        changed_orders = changes_df[changes_df['变化类型'] == '📝 变更']['订单号'].nunique()
+        important = len(changes_df[changes_df['重要程度'] == '🔴 重要'])
+    else:
+        new_count = len(new_order_nos) - len(old_data)
+        changed_orders = 0
+        important = 0
+
+    return {
+        "changes": changes_df,
+        "summary": {
+            "new_orders": new_count,
+            "changed_orders": changed_orders,
+            "unchanged_orders": len(old_data) - changed_orders,
+            "important_changes": important,
+        }
+    }
+
+
+def _calc_profit_impact(field_key, old_val, new_val, old_data, new_row):
+    """计算字段变化对利润的影响"""
+    if field_key in ('order_status', 'after_sale_status'):
+        old_str = str(old_val) if old_val else ''
+        new_str = str(new_val) if new_val else ''
+        if ('取消' in new_str or '退款成功' in new_str) and ('取消' not in old_str and '退款成功' not in old_str):
+            income = old_data.get('merchant_income') or 0
+            return f'🔻 -{float(income):.2f} 元（收入损失）'
+        if ('取消' in old_str or '退款成功' in old_str) and ('取消' not in new_str and '退款成功' not in new_str):
+            new_income = float(new_row.get('merchant_income', 0) or 0)
+            return f'🔺 +{new_income:.2f} 元（恢复）'
+
+    if field_key == 'merchant_income':
+        old_v = float(old_val) if old_val else 0
+        new_v = float(new_val) if new_val else 0
+        diff = new_v - old_v
+        return f'{"🔺" if diff > 0 else "🔻"} {diff:+.2f} 元' if abs(diff) >= 0.01 else '无'
+
+    if field_key == 'product_quantity':
+        old_q = int(float(old_val)) if old_val is not None else 0
+        new_q = int(float(new_val)) if new_val is not None else 0
+        diff = new_q - old_q
+        return f'📦 {"+" if diff > 0 else ""}{diff} 件' if diff != 0 else '无'
+
+    if field_key == 'product_spec':
+        return '⚠️ 规格变化影响花型/米数匹配'
+
+    if field_key in ('product_total', 'user_payment'):
+        old_v = float(old_val) if old_val else 0
+        new_v = float(new_val) if new_val else 0
+        diff = new_v - old_v
+        return f'{"🔺" if diff > 0 else "🔻"} {diff:+.2f} 元' if abs(diff) >= 0.01 else '无'
+
+    return '-'
+
+
+# ============================
 # 网页上传导入（直接接收 DataFrame）
 # ============================
 def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
     """
     从 DataFrame 导入数据（用于网页上传）
-    返回：{"success": bool, "message": str, "stats": dict}
+    返回：{"success": bool, "message": str, "stats": dict, "changes": dict}
     """
     try:
         # 1. 检查必要列是否存在
@@ -253,7 +445,8 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
             return {
                 "success": False,
                 "message": f"缺少必要列: {missing}",
-                "stats": {}
+                "stats": {},
+                "changes": None,
             }
 
         # 2. 检查 DataFrame 是否为空
@@ -261,7 +454,8 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
             return {
                 "success": False,
                 "message": "导入的数据为空",
-                "stats": {}
+                "stats": {},
+                "changes": None,
             }
 
         # 3. 按字段映射重命名
@@ -302,7 +496,10 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
             "文件来源": filename
         }
 
-        # 6. UPSERT 到数据库
+        # 6. 🔧 检测订单变化（在 UPSERT 之前对比新旧数据）
+        changes = detect_order_changes(df)
+
+        # 7. UPSERT 到数据库
         with engine.begin() as conn:
             total = 0
             for _, row in df.iterrows():
@@ -330,14 +527,16 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
         return {
             "success": True,
             "message": f"成功导入 {total} 条数据到 {orders} 表",
-            "stats": stats
+            "stats": stats,
+            "changes": changes,
         }
 
     except Exception as e:
         return {
             "success": False,
             "message": str(e),
-            "stats": {}
+            "stats": {},
+            "changes": None,
         }
 if __name__ == "__main__":
     # 自动查找最新文件
