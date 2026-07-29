@@ -651,8 +651,8 @@ elif menu == "📊 退款明细":
         total_revenue_query = text("""
                 SELECT SUM(merchant_income) 
                 FROM data2026 
-                WHERE DATE(order_time) >= :start 
-                  AND DATE(order_time) <= :end
+                WHERE DATE(delivery_time) >= :start 
+                  AND DATE(delivery_time) <= :end
                   AND order_status != '已取消'
                   AND after_sale_status NOT LIKE '%退款成功%'
             """)
@@ -937,10 +937,10 @@ elif menu == "⚙️ 系统设置":
         # 订单日期范围（起始日期之后）
         order_range = conn.execute(
             text("""
-                SELECT MIN(DATE(order_time)), MAX(DATE(order_time))
+                SELECT MIN(DATE(delivery_time)), MAX(DATE(delivery_time))
                 FROM data2026 
-                WHERE order_time IS NOT NULL 
-                  AND DATE(order_time) >= :start
+                WHERE delivery_time IS NOT NULL 
+                  AND DATE(delivery_time) >= :start
             """),
             {"start": current_start_date}
         ).fetchone()
