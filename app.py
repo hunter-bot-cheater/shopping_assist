@@ -336,16 +336,16 @@ elif menu == "📋 库存流水":
 
 
 elif menu == "🚨 预警中心":
-    st.header("🚨 补货预警")
+    st.header("🚨 补货预警 & 拿货建议")
+    st.caption("💡 基于近7天销量和当前库存，为所有花型提供拿货建议，按紧急程度排序")
 
-    from inventory_service import get_inventory_report, get_latest_snapshot_date
+    from inventory_service import get_inventory_report, get_latest_snapshot_date, get_restock_suggestions
     from add_del_flower import get_available_flowers
 
     latest_date = get_latest_snapshot_date()
     if not latest_date:
         st.info("暂无库存数据")
     else:
-        # 🔧 获取可用花型（未删除的）
         available_df = get_available_flowers()
         available_flowers = set(available_df['flower'].tolist())
 
@@ -354,12 +354,98 @@ elif menu == "🚨 预警中心":
         else:
             inv_df = get_inventory_report()
 
-            # 🔧 只保留可用花型（未删除的）
+            # 只保留可用花型（未删除的）
             inv_df = inv_df[inv_df['花型'].isin(available_flowers)]
 
             if inv_df.empty:
                 st.info("当前没有可用的花型数据")
             else:
+                # ==================== 拿货建议（所有花型） ====================
+                st.subheader("📦 拿货建议（按紧急程度排序）")
+
+                # 可配置拿货目标天数
+                col_target, col_spacer = st.columns([1, 3])
+                with col_target:
+                    target_days = st.number_input(
+                        "拿货目标天数",
+                        min_value=1,
+                        max_value=30,
+                        value=7,
+                        step=1,
+                        help="建议拿够多少天的库存。例：7 表示建议拿货到够卖 7 天"
+                    )
+
+                suggestions_df = get_restock_suggestions(target_days=target_days)
+
+                if suggestions_df.empty:
+                    st.info("暂无花型数据")
+                else:
+                    # 汇总统计
+                    total_suggest = suggestions_df['建议拿货(米)'].sum()
+                    need_restock = suggestions_df[suggestions_df['建议拿货(米)'] > 0]
+                    no_need = suggestions_df[suggestions_df['建议拿货(米)'] == 0]
+
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("🌸 花型总数", f"{len(suggestions_df)} 个")
+                    with col2:
+                        st.metric("📦 建议总拿货量", f"{total_suggest:.1f} 米")
+                    with col3:
+                        st.metric("🔴 需要拿货", f"{len(need_restock)} 个花型",
+                                  delta=f"共 {need_restock['建议拿货(米)'].sum():.1f} 米" if len(need_restock) > 0 else None)
+                    with col4:
+                        st.metric("🟢 库存充足", f"{len(no_need)} 个花型")
+
+                    st.divider()
+
+                    # 表格样式：根据紧急程度着色
+                    def color_suggestions(row):
+                        days = row['可售天数']
+                        if days is None:
+                            # 无销量，灰色
+                            return ['color: #999'] * len(row)
+                        elif days <= 1:
+                            # 极度紧急，深红
+                            return ['background-color: #ff6b6b; color: white'] * len(row)
+                        elif days <= 3:
+                            # 紧急，浅红
+                            return ['background-color: #ffcccc'] * len(row)
+                        elif days <= 7:
+                            # 关注，浅黄
+                            return ['background-color: #fff3cd'] * len(row)
+                        elif row['建议拿货(米)'] > 0:
+                            # 有一些建议但不太紧急
+                            return ['background-color: #e8f5e9'] * len(row)
+                        else:
+                            # 库存充足，正常
+                            return [''] * len(row)
+
+                    # 格式化显示：可售天数 None → "-"
+                    display_df = suggestions_df.copy()
+                    display_df['可售天数'] = display_df['可售天数'].apply(
+                        lambda x: "-" if x is None else x
+                    )
+
+                    st.dataframe(
+                        display_df.style.apply(color_suggestions, axis=1),
+                        use_container_width=True,
+                        height=500
+                    )
+
+                    st.caption(
+                        "🔴 深红 = 可售 ≤1天（立即拿货） | "
+                        "🟠 浅红 = 可售 ≤3天 | "
+                        "🟡 浅黄 = 可售 ≤7天 | "
+                        "🟢 浅绿 = 需要拿货但不紧急 | "
+                        "⬜ 白色 = 库存充足 | "
+                        "⬜ 灰色 = 无销量"
+                    )
+
+                st.divider()
+
+                # ==================== 原有预警列表 ====================
+                st.subheader("⚠️ 库存预警明细（低于预警天数）")
+
                 with engine.connect() as conn:
                     avg_sales = pd.read_sql(
                         text("""
@@ -383,13 +469,10 @@ elif menu == "🚨 预警中心":
                     ]
 
                 if not alert_df.empty:
-                    st.subheader("⚠️ 以下花型库存不足（可售天数低于阈值）")
                     st.dataframe(
                         alert_df[['花型', '当前库存(米)', '日均销量', '可售天数', '预警天数']],
                         use_container_width=True
                     )
-
-                    # 🔧 显示当前可用花型总数
                     st.caption(f"📊 当前监控花型数：{len(inv_df)} 个（已排除已删除花型）")
                 else:
                     st.success("✅ 所有花型库存充足，暂无补货预警")
