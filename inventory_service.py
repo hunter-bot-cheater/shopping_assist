@@ -783,15 +783,63 @@ def update_inventory_snapshot(flower, target_date, new_stock, operator='system',
                 {"new": new_stock, "op": operator, "f": flower, "d": target_date}
             )
 
-            # 3. 🔧 更新后续所有日期的快照（加上 delta，但不低于 0）
-            affected = conn.execute(
+            # 3. ★ 修复：逐日重算后续快照（而非简单加 delta）
+            #    确保后续日期的销售/入库/调整都基于新库存正确计算
+            future_dates = conn.execute(
                 text("""
-                    UPDATE inventory_snapshot
-                    SET stock = GREATEST(stock + :delta, 0), updated_by = :op, updated_at = CURRENT_TIMESTAMP
+                    SELECT snapshot_date FROM inventory_snapshot
                     WHERE flower = :f AND snapshot_date > :d
+                    ORDER BY snapshot_date
                 """),
-                {"delta": delta, "op": operator, "f": flower, "d": target_date}
-            ).rowcount
+                {"f": flower, "d": target_date}
+            ).fetchall()
+            current_stock = new_stock
+            affected = 0
+            for (row_date,) in future_dates:
+                # 3a. 查询当日销售（scalar 返回 Decimal，需转 float）
+                daily_sales = float(
+                    conn.execute(
+                        text("SELECT COALESCE(SUM(total_meters), 0) FROM daily_report_cache WHERE report_date = :d AND flower = :f"),
+                        {"d": row_date, "f": flower}
+                    ).scalar() or 0
+                )
+
+                # 3b. 查询当日入库
+                daily_inbound = float(
+                    conn.execute(
+                        text("""
+                            SELECT COALESCE(SUM(change_qty), 0) FROM inventory_log
+                            WHERE flower = :f AND change_type = '入库'
+                              AND DATE(created_at) = :d
+                        """),
+                        {"f": flower, "d": row_date}
+                    ).scalar() or 0
+                )
+
+                # 3c. 查询当日手动调整（排除本次调整自身写入的日志）
+                daily_adjust = float(
+                    conn.execute(
+                        text("""
+                            SELECT COALESCE(SUM(change_qty), 0) FROM inventory_log
+                            WHERE flower = :f AND change_type = '手动调整'
+                              AND DATE(created_at) = :d
+                              AND (reference NOT LIKE :exclude OR reference IS NULL)
+                        """),
+                        {"f": flower, "d": row_date, "exclude": f"快照调整 {target_date}%"}
+                    ).scalar() or 0
+                )
+
+                # 3d. 计算新库存 = 前日库存 - 销售 + 入库 + 调整
+                current_stock = max(current_stock - daily_sales + daily_inbound + daily_adjust, 0)
+                conn.execute(
+                    text("""
+                        UPDATE inventory_snapshot
+                        SET stock = :new, updated_by = :op, updated_at = CURRENT_TIMESTAMP
+                        WHERE flower = :f AND snapshot_date = :d
+                    """),
+                    {"new": current_stock, "op": operator, "f": flower, "d": row_date}
+                )
+                affected += 1
 
             # 4. 🔧 新增：写入 inventory_log（库存流水）
             # 获取修改后当天该花型的库存（即 new_stock）
