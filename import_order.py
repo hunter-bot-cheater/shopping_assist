@@ -481,7 +481,9 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
 
         # 删除全为空的行
         df = df.dropna(how='all')
-
+        # 统一花型名称（将白底黑色条纹合并到白底乱纹）
+        if 'product_spec' in df.columns:
+            df['product_spec'] = df['product_spec'].astype(str).str.replace('白底黑色条纹', '白底乱纹', regex=False)
         # 4. 添加默认字段
         df["cost"] = 0.0
         df["meter"] = 0.0

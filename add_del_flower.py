@@ -180,9 +180,13 @@ def delete_flower(flower_name, operator="system"):
             if existing[0] == 1:
                 return (False, f"❌ 花型「{flower_name}」已处于删除状态")
 
-            # 2. 获取当前库存信息（用于流水记录）
+            # 🔧 2. 获取当前库存（从快照表最新日期读取）
             stock_info = conn.execute(
-                text("SELECT current_stock FROM inventory WHERE flower = :f"),
+                text("""
+                    SELECT stock FROM inventory_snapshot 
+                    WHERE flower = :f 
+                    ORDER BY snapshot_date DESC LIMIT 1
+                """),
                 {"f": flower_name}
             ).fetchone()
             current_stock = float(stock_info[0]) if stock_info else 0.0
@@ -265,9 +269,13 @@ def restore_flower(flower_name, operator="system"):
                 WHERE flower = :f
             """), {"f": flower_name})
 
-            # 3. 获取当前库存（恢复后库存保持原样）
+            # 🔧 3. 获取当前库存（从快照表最新日期读取）
             stock_info = conn.execute(
-                text("SELECT current_stock FROM inventory WHERE flower = :f"),
+                text("""
+                    SELECT stock FROM inventory_snapshot 
+                    WHERE flower = :f 
+                    ORDER BY snapshot_date DESC LIMIT 1
+                """),
                 {"f": flower_name}
             ).fetchone()
             current_stock = float(stock_info[0]) if stock_info else 0.0
