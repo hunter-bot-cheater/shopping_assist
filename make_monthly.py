@@ -517,7 +517,7 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
     # 后面进入花型匹配
     # ======================================================
 
-    cost_map = load_cost_map()
+    cost_map = load_cost_map(end_date)
 
     cost_flowers=set(cost_map.keys())
 
@@ -552,8 +552,11 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
         x if x in cost_flowers else None
     )
 
-
-
+    # ─── 花型标准化映射（合并同名花型） ───
+    flower_alias_map = {
+        '白底黑色条纹': '白底乱纹',
+    }
+    df['花型'] = df['花型'].replace(flower_alias_map)
 
     # ----------------------------------------------------------
     # 第二层：
@@ -1583,8 +1586,8 @@ if __name__=="__main__":
     generate_monthly_report(
 
 
-        start_date="2026-07-01",
-        end_date="2026-07-22",
+        start_date="2026-05-01",
+        end_date="2026-07-30",
 
 
         force=True

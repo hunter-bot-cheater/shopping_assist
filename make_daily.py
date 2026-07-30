@@ -201,6 +201,14 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     df['spec_flower'] = df['product_spec'].apply(extract_flower_from_spec)
     df['花型'] = df['spec_flower'].apply(lambda x: x if x in cost_flowers else None)
 
+    # ─── 花型标准化映射 ───
+    # 将“白底乱纹”和“白底黑色条纹”统一映射到“白底乱纹”
+    # 确保“白底乱纹”在成本表中存在
+    flower_alias_map = {
+        '白底乱纹': '白底乱纹',
+        '白底黑色条纹': '白底乱纹',
+    }
+    df['花型'] = df['花型'].replace(flower_alias_map)
     # 第二步：从商品名称匹配
     unmatched_mask = df['花型'].isna()
     if unmatched_mask.any():
