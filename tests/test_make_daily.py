@@ -7,6 +7,8 @@ Tests cover:
 - ``generate_daily_report`` with fully mocked dependencies
 """
 from unittest.mock import MagicMock, patch, PropertyMock
+import os
+
 import pandas as pd
 import pytest
 
@@ -14,6 +16,8 @@ from make_daily import (
     load_cost_map,
     generate_daily_report,
     generate_all_missing_reports,
+    generate_range_report,
+    build_platform_summary,
     ensure_output_dir,
 )
 
@@ -133,7 +137,7 @@ def _make_mock_connection():
 class TestPlatformGrouping:
 
     def test_summary_grouped_by_platform(self, tmp_path):
-        """花型汇总按平台分行；平台汇总 sheet 三平台齐全；明细含平台列。"""
+        """花型汇总为左右分列宽表；平台汇总 sheet 三平台齐全；明细含平台列。"""
         order_df = pd.DataFrame({
             'id': [1, 2],
             'order_no': ['ORD001', 'ORD002'],
@@ -173,14 +177,37 @@ class TestPlatformGrouping:
             with pd.ExcelFile(xlsx_files[0]) as xf:
                 assert set(xf.sheet_names) == {'花型汇总', '平台汇总', '订单明细'}
 
-                # 花型汇总：各平台分项 + 汇总行 + 总计行
-                summary = pd.read_excel(xf, '花型汇总')
-                assert '平台' in summary.columns
-                assert '拼多多' in summary['平台'].tolist()
-                assert '淘宝' in summary['平台'].tolist()
-                assert '汇总' in summary['平台'].tolist()
-                assert '【总计】' in summary['花型'].tolist()
-                assert '抖音' not in summary['平台'].tolist()  # 无抖音数据，不分项
+                # 花型汇总：左右分列（花型 | 拼多多6列 | 空2 | 淘宝6列 | 空2 | 汇总6列 = 23 列）
+                head = pd.read_excel(xf, '花型汇总', header=None, nrows=2)
+                assert head.shape[1] == 23
+                # 第1行：平台合并表头
+                assert head.iloc[0, 0] == '花型'
+                assert head.iloc[0, 1] == '拼多多'
+                assert head.iloc[0, 9] == '淘宝'
+                assert head.iloc[0, 17] == '汇总'
+                # 第2行：指标名
+                assert head.iloc[1, 1] == '订单数'
+                assert head.iloc[1, 4] == '营业额'
+                assert head.iloc[1, 9] == '订单数'
+                assert head.iloc[1, 17] == '订单数'
+
+                # 数据行：花型按汇总营业额降序，末尾总计行
+                data = pd.read_excel(xf, '花型汇总', header=None, skiprows=2)
+                assert data.shape[1] == 23
+                flowers = data[0].tolist()
+                assert '花型A' in flowers
+                assert '花型B' in flowers
+                assert flowers[-1] == '【总计】'
+
+                # 拼多多块（花型A）/ 淘宝块（花型B）数据落位正确
+                row_a = data[data[0] == '花型A'].iloc[0]
+                row_b = data[data[0] == '花型B'].iloc[0]
+                assert row_a[1] == 1        # 拼多多_订单数
+                assert row_a[4] == 50.0     # 拼多多_营业额
+                assert row_b[9] == 1        # 淘宝_订单数
+                assert row_b[12] == 90.0    # 淘宝_营业额
+                assert row_a[17] == 1       # 汇总_订单数
+                assert data[data[0] == '【总计】'].iloc[0][17] == 2  # 汇总订单总数
 
                 # 平台汇总：拼多多/淘宝/抖音 三行齐全（无数据补 0）+ 合计
                 ps = pd.read_excel(xf, '平台汇总')
@@ -192,6 +219,132 @@ class TestPlatformGrouping:
                 # 订单明细含平台列
                 detail = pd.read_excel(xf, '订单明细')
                 assert '平台' in detail.columns
+
+
+# ===========================================================================
+# build_platform_summary  （左右分列宽表）
+# ===========================================================================
+
+class TestBuildPlatformSummary:
+
+    def test_wide_layout_and_total(self):
+        """build_platform_summary 返回左右分列宽表，含总计行与空列占位。"""
+        normal_df = pd.DataFrame({
+            '花型': ['花型A', '花型B'],
+            '平台': ['拼多多', '淘宝'],
+            'order_no': ['O1', 'O2'],
+            '成本': [20.0, 93.0],
+            '米数': [2.0, 6.0],
+            'merchant_income': [50.0, 90.0],
+            '快递费': [2.5, 2.5],
+            '盈利': [27.5, -5.5],
+        })
+        wide = build_platform_summary(normal_df)
+        # 花型 | 拼多多6列 | 空2 | 淘宝6列 | 空2 | 汇总6列 = 23 列
+        assert len(wide.columns) == 23
+        assert wide.columns[0] == '花型'
+        assert '拼多多_营业额' in wide.columns
+        assert '淘宝_营业额' in wide.columns
+        assert '汇总_营业额' in wide.columns
+        assert wide['花型'].tolist()[-1] == '【总计】'
+
+        row = wide[wide['花型'] == '花型A'].iloc[0]
+        assert row['拼多多_营业额'] == 50.0
+        assert row['淘宝_营业额'] == 0
+        assert row['汇总_营业额'] == 50.0
+
+        tot = wide[wide['花型'] == '【总计】'].iloc[0]
+        assert tot['拼多多_营业额'] == 50.0
+        assert tot['淘宝_营业额'] == 90.0
+        assert tot['汇总_营业额'] == 140.0
+        # 空列占位（每平台块独立）
+        assert wide['_spacer_0_1'].iloc[0] == ''
+        assert wide['_spacer_0_2'].iloc[0] == ''
+        assert wide['_spacer_1_1'].iloc[0] == ''
+
+
+# ===========================================================================
+# generate_range_report
+# ===========================================================================
+
+class TestGenerateRangeReport:
+
+    def test_range_report_sheets(self, tmp_path):
+        """区间报告生成 Excel：花型汇总/平台汇总/订单明细，文件名含日期区间。"""
+        order_df = pd.DataFrame({
+            'id': [1, 2],
+            'order_no': ['ORD001', 'ORD002'],
+            'product': ['花型A布料', '花型B布料'],
+            'product_spec': ['花型A,2米', '花型B,3米'],
+            'product_quantity': [1, 1],
+            'merchant_income': [50.0, 90.0],
+            'cost': [0.0, 0.0],
+            'meter': [0.0, 0.0],
+            'express_cost': [0.0, 0.0],
+            'traffic_cost': [0.0, 0.0],
+            'profit': [0.0, 0.0],
+            'after_sale_status': ['', ''],
+            'order_status': ['已发货', '已发货'],
+            'platform': [0, 1],  # 拼多多 + 淘宝
+        })
+
+        with patch('make_daily.OUTPUT_DIR', str(tmp_path)), \
+             patch('make_daily.engine') as mock_engine, \
+             patch('pandas.read_sql', return_value=order_df), \
+             patch('make_daily.load_cost_map',
+                   return_value={'花型A': 10.0, '花型B': 15.5}):
+            mock_engine.connect.return_value = _make_mock_connection()
+
+            result = generate_range_report('2026-07-01', '2026-07-15', force=True)
+            assert isinstance(result, str)
+            assert os.path.basename(result) == '区间报告_20260701-20260715.xlsx'
+            assert os.path.exists(result)
+
+            with pd.ExcelFile(result) as xf:
+                assert set(xf.sheet_names) == {'花型汇总', '平台汇总', '订单明细'}
+                head = pd.read_excel(xf, '花型汇总', header=None, nrows=2)
+                assert head.shape[1] == 23
+                assert head.iloc[0, 9] == '淘宝'
+                assert head.iloc[0, 17] == '汇总'
+
+    def test_range_report_counts_shipped_taobao(self, tmp_path):
+        """发货且不退款的淘宝订单计入，不因 merchant_income=0 被排除。"""
+        order_df = pd.DataFrame({
+            'id': [1, 2],
+            'order_no': ['ORD001', 'ORD002'],
+            'product': ['花型A布料', '花型A布料'],
+            'product_spec': ['花型A,2米', '花型A,2米'],
+            'product_quantity': [1, 1],
+            'merchant_income': [50.0, 0.0],
+            'cost': [0.0, 0.0],
+            'meter': [0.0, 0.0],
+            'express_cost': [0.0, 0.0],
+            'traffic_cost': [0.0, 0.0],
+            'profit': [0.0, 0.0],
+            'after_sale_status': ['', ''],
+            'order_status': ['已发货', '已发货'],
+            'platform': [0, 1],  # 拼多多 + 淘宝（merchant_income=0）
+        })
+
+        with patch('make_daily.OUTPUT_DIR', str(tmp_path)), \
+             patch('make_daily.engine') as mock_engine, \
+             patch('pandas.read_sql', return_value=order_df), \
+             patch('make_daily.load_cost_map', return_value={'花型A': 10.0}):
+            mock_engine.connect.return_value = _make_mock_connection()
+
+            result = generate_range_report('2026-07-01', '2026-07-15', force=True)
+            assert result and os.path.exists(result)
+
+            with pd.ExcelFile(result) as xf:
+                ps = pd.read_excel(xf, '平台汇总')
+                tb = ps[ps['平台'] == '淘宝'].iloc[0]
+                assert tb['订单数'] == 1      # 淘宝订单计入（即使营业额为0）
+                assert tb['营业额'] == 0.0
+                pdd = ps[ps['平台'] == '拼多多'].iloc[0]
+                assert pdd['订单数'] == 1
+                assert pdd['营业额'] == 50.0
+                # 合计订单数 = 2
+                assert ps[ps['平台'] == '合计'].iloc[0]['订单数'] == 2
 
 
 # ===========================================================================
