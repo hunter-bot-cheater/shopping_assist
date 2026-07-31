@@ -4,7 +4,9 @@ import os
 import glob
 import re
 from datetime import datetime
-from sqlalchemy import text
+
+import sqlalchemy
+
 from mysql_conn import engine
 
 # ============================
@@ -45,6 +47,31 @@ COLUMN_MAPPING = {
     "分期方式": "installment_method",
 }
 
+# ============================
+# 平台配置（可扩展：新增平台只需加常量 + 特征列 + 列映射）
+# ============================
+PLATFORM_PDD, PLATFORM_TAOBAO, PLATFORM_DOUYIN = 0, 1, 2
+PLATFORM_NAMES = {PLATFORM_PDD: "拼多多", PLATFORM_TAOBAO: "淘宝", PLATFORM_DOUYIN: "抖音"}
+
+# 平台特征列（用于自动识别平台；dict 插入顺序=识别优先级，淘宝在前）
+PLATFORM_FEATURE_COLUMNS = {
+    PLATFORM_TAOBAO: ['订单编号', '商品标题', '宝贝种类', '商品名称'],
+    PLATFORM_PDD: ['订单号', '商品', '商家实收金额(元)', '售后状态'],
+}
+
+# 各平台 列名 -> 标准列名 映射（先转成拼多多标准列，再统一走 COLUMN_MAPPING）
+PLATFORM_COLUMN_MAPPINGS = {
+    PLATFORM_TAOBAO: {
+        '订单编号': '订单号', '商品标题': '商品', '商品名称': '商品',
+        '总金额(旧版)': '商品总价(元)', '买家应付邮费': '邮费(元)',
+        '买家实付金额': '用户实付金额(元)', '买家应付货款': '商家实收金额(元)',
+        '宝贝总数量': '商品数量(件)', '发货时间': '发货时间', '确认收货时间': '确认收货时间',
+        '商品属性SKU': '商品规格', '物流单号': '快递单号', '物流公司': '快递公司',
+        '订单创建时间': '订单成交时间', '订单状态': '订单状态', '商家备注': '商家备注',
+        '退款金额': '_temp_refund_amount', '订单关闭原因': '_temp_close_reason',
+    },
+}
+
 # 日期时间列（需要转换）
 DATETIME_COLUMNS = ["发货时间", "确认收货时间", "订单成交时间"]
 
@@ -54,6 +81,8 @@ TEXT_COLUMNS = [
     "商家编码-商品维度", "商家备注", "售后状态", "快递单号", "快递公司",
     "是否分期", "手续费承担方", "分期方式"
 ]
+
+
 
 # 数值列（确保转换为数字）
 NUMERIC_COLUMNS = [
@@ -98,6 +127,34 @@ def clean_numeric(x):
     except:
         return None
 
+
+def extract_flower_from_spec(spec):
+    """从商品规格中提取花型（兼容拼多多/淘宝格式）。
+
+    淘宝 SKU 形如「颜色分类:黑底条纹两米（长度自选）」，需先去掉前缀和米数后缀。
+    """
+    if pd.isna(spec):
+        return None
+    spec = str(spec).strip()
+    if not spec:
+        return None
+    # 淘宝 SKU 前缀：颜色分类:XX一米（门幅1.43米）
+    if '颜色分类' in spec:
+        spec = re.sub(r'^.*?颜色分类[:：]?', '', spec).strip()
+    # 多个 SKU 用逗号分隔时取第一个
+    for sep in [',', '，']:
+        if sep in spec:
+            spec = spec.split(sep)[0].strip()
+            break
+    # 括号前（门幅/促销说明等）
+    for sep in ['（', '(']:
+        if sep in spec:
+            spec = spec.split(sep)[0].strip()
+            break
+    # 去掉米数后缀：一米/两米/三米... 以及"价格多拍连裁"等尾巴
+    spec = re.sub(r'(半米|一米|两米|二米|三米|四米|五米|六米|\d+(?:\.\d+)?\s*米).*$', '', spec).strip()
+    return spec if spec else None
+
 def get_latest_file(directory, pattern):
     """获取目录中符合模式的最新文件（按修改时间）"""
     full_pattern = os.path.join(directory, pattern)
@@ -106,6 +163,75 @@ def get_latest_file(directory, pattern):
         return None
     latest = max(files, key=os.path.getmtime)
     return latest
+
+def detect_platform(df):
+    """根据特征列自动识别订单来源平台，返回 PLATFORM_* 常量；无匹配时默认拼多多。"""
+    cols = set(df.columns)
+    for platform, features in PLATFORM_FEATURE_COLUMNS.items():
+        if any(f in cols for f in features):
+            return platform
+    return PLATFORM_PDD
+
+def gen_taobao_after_sale_status(row):
+    """淘宝无原生售后状态列，根据 订单状态/退款金额/发货收货时间 合成。"""
+    order_status = str(row.get('订单状态', ''))
+    refund_amount = float(row.get('_temp_refund_amount', 0) or 0)
+    delivery_time = row.get('发货时间')
+    receive_time = row.get('确认收货时间')
+    close_reason = str(row.get('_temp_close_reason', ''))
+
+    # 交易成功，无退款
+    if order_status == '交易成功' and refund_amount == 0:
+        return None
+
+    # 交易关闭 + 退款金额 > 0
+    if order_status == '交易关闭' and refund_amount > 0:
+        if pd.isna(delivery_time) or delivery_time is None:
+            return '未发货，退款成功'
+        elif pd.isna(receive_time) or receive_time is None:
+            return '已发货，退款成功'
+        else:
+            return '已收货，退款成功'
+
+    # 有些退款订单订单状态可能不是"交易关闭"，但关闭原因是退款
+    if '退款' in close_reason and refund_amount > 0:
+        if pd.isna(delivery_time) or delivery_time is None:
+            return '未发货，退款成功'
+        elif pd.isna(receive_time) or receive_time is None:
+            return '已发货，退款成功'
+        else:
+            return '已收货，退款成功'
+
+    return None
+
+def platform_column_exists():
+    """检查 data2026 表是否已有 platform 列。"""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sqlalchemy.text(f"SHOW COLUMNS FROM {orders} LIKE 'platform'")
+            ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+def ensure_platform_column():
+    """确保 data2026 表有 platform 列，缺失时自动添加（幂等，可安全重复调用）。
+    返回 (ok, message)；ok=True 时 message 仅在本次执行了迁移时非空。"""
+    if platform_column_exists():
+        return True, ""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sqlalchemy.text(f"""
+                    ALTER TABLE {orders}
+                    ADD COLUMN platform TINYINT(1) NOT NULL DEFAULT 0
+                    COMMENT '订单来源平台: 0=拼多多, 1=淘宝, 2=抖音(预留)' AFTER id
+                """)
+            )
+        return True, "✅ 已自动为 data2026 表添加 platform 字段（迁移完成）"
+    except Exception as e:
+        return False, f"自动迁移失败，请手动运行 python migrate_platform.py：{e}"
 
 # ============================
 # 主导入函数（改为 UPSERT）
@@ -137,7 +263,25 @@ def import_excel(file_path=None):
 
     print(f"读取到 {len(df)} 行数据，{len(df.columns)} 列")
 
-    # 3. 检查必要列是否存在
+    # 3. 检测平台 + 平台列映射（淘宝/拼多多自动识别）
+    platform = detect_platform(df)
+    print(f"🔍 检测到订单平台: {PLATFORM_NAMES.get(platform, platform)}")
+    mapping = PLATFORM_COLUMN_MAPPINGS.get(platform, {})
+    if mapping:
+        existing_mapping = {k: v for k, v in mapping.items() if k in df.columns}
+        df = df.rename(columns=existing_mapping)
+        # 多个平台列映射到同一标准列时会产生重复列，保留第一个避免取值返回 Series
+        df = df.loc[:, ~df.columns.duplicated()]
+        if platform == PLATFORM_TAOBAO:
+            df['售后状态'] = df.apply(gen_taobao_after_sale_status, axis=1)
+            df = df.drop(columns=['_temp_refund_amount', '_temp_close_reason'], errors='ignore')
+            # 商品标题为空时（淘宝关闭订单导出为空），从SKU规格提取花型名兜底
+            if '商品规格' in df.columns:
+                empty_prod = df['商品'].isna() & df['商品规格'].notna()
+                if empty_prod.any():
+                    df.loc[empty_prod, '商品'] = df.loc[empty_prod, '商品规格'].apply(extract_flower_from_spec)
+
+    # 4. 检查必要列是否存在（映射后统一为拼多多标准列名）
     required_cols = ["订单号", "商品", "商家实收金额(元)"]
     missing = [col for col in required_cols if col not in df.columns]
     if missing:
@@ -145,13 +289,21 @@ def import_excel(file_path=None):
         print("当前列名:", df.columns.tolist())
         return
 
-    # 4. 按字段映射重命名
+    # 确保 data2026 有 platform 列（缺失时自动迁移）
+    ok, migrate_msg = ensure_platform_column()
+    if not ok:
+        print(f"错误：{migrate_msg}")
+        return
+    if migrate_msg:
+        print(migrate_msg)
+
+    # 5. 按字段映射重命名
     existing_cols = [col for col in COLUMN_MAPPING.keys() if col in df.columns]
     df = df[existing_cols]
     df = df.rename(columns=COLUMN_MAPPING)
     print(f"映射后保留 {len(df.columns)} 个字段")
 
-    # 5. 数据清洗
+    # 6. 数据清洗
     for col in TEXT_COLUMNS:
         db_col = COLUMN_MAPPING.get(col)
         if db_col and db_col in df.columns:
@@ -171,14 +323,15 @@ def import_excel(file_path=None):
     df = df.dropna(how='all')
     print(f"清洗后剩余 {len(df)} 行数据")
 
-    # 6. 添加默认字段（后续由其他脚本计算）
+    # 7. 添加默认字段（后续由其他脚本计算）
     df["cost"] = 0.0
     df["meter"] = 0.0
     df["express_cost"] = 0.0
     df["traffic_cost"] = 0.0
     df["profit"] = 0.0
+    df["platform"] = platform
 
-    # 7. 使用 UPSERT 逐行插入（基于 order_no 唯一键）
+    # 8. 使用 UPSERT 逐行插入（基于 order_no 唯一键）
     from sqlalchemy.dialects.mysql import insert
 
     with engine.begin() as conn:
@@ -215,7 +368,7 @@ def import_excel(file_path=None):
                         params[col] = None
                     else:
                         params[col] = val
-                conn.execute(text(sql), params)
+                conn.execute(sqlalchemy.text(sql), params)
                 total += 1
             print(f"已处理 {total} 条记录")
 
@@ -228,6 +381,56 @@ def import_excel(file_path=None):
         sync_refund_details()
     except Exception as e:
         print(f"⚠️ 退款明细同步失败（不影响主导入）: {e}")
+
+        # ============================================================
+        # 🆕 6. 自动生成缺失日期的日报
+        # ============================================================
+        if not df.empty and 'delivery_time' in df.columns:
+            from make_daily import generate_daily_report
+            from sqlalchemy import text
+
+            df['delivery_time'] = pd.to_datetime(df['delivery_time'], errors='coerce')
+            order_dates = df[df['delivery_time'].notna()]['delivery_time'].dt.date.unique()
+            order_dates = sorted(order_dates)
+
+            if len(order_dates) > 0:
+                with engine.connect() as conn:
+                    placeholders = ','.join(['%s'] * len(order_dates))
+                    query = text(f"""
+                            SELECT DISTINCT report_date 
+                            FROM daily_report_cache 
+                            WHERE report_date IN ({placeholders})
+                        """)
+                    existing_dates = conn.execute(query, order_dates).fetchall()
+                    existing_date_set = {row[0] for row in existing_dates}
+
+                missing_dates = [d for d in order_dates if d not in existing_date_set]
+
+                if len(missing_dates) > 0:
+                    print(f"🔄 发现 {len(missing_dates)} 个缺失日报的日期，自动生成...")
+                    for date in missing_dates:
+                        date_str = date.strftime('%Y-%m-%d')
+                        try:
+                            generate_daily_report(date_str, force=True)
+                        except Exception as e:
+                            print(f"  ⚠️ {date_str} 日报生成失败：{e}")
+                    print(f"✅ 缺失日报生成完成")
+                else:
+                    print("ℹ️ 所有订单日期均已有日报")
+            else:
+                print("ℹ️ 导入数据中没有有效的发货日期")
+
+        return {
+            "success": True,
+            "message": f"成功导入 {len(df)} 条数据到 {orders} 表",
+            "stats": {"总行数": len(df), "成功导入": len(df)}
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": str(e),
+            "stats": {}
+        }
 # 为了使用 text 方式，我们需要定义表名变量，已经存在 orders
 # 注意：上述方法在循环内执行多次单条插入，性能可能较慢，但数据量不大（几百条）可以接受。
 # 若要更快，可使用 executemany 方式，但需构造多行 VALUES，此处暂用单条。
@@ -279,7 +482,7 @@ def detect_order_changes(df):
                 FROM {orders}
                 WHERE order_no IN ({placeholders})
             """
-            result = conn.execute(text(sql)).fetchall()
+            result = conn.execute(sqlalchemy.text(sql)).fetchall()
             existing_rows.extend(result)
 
     old_data = {}
@@ -435,10 +638,42 @@ def _calc_profit_impact(field_key, old_val, new_val, old_data, new_row):
 def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
     """
     从 DataFrame 导入数据（用于网页上传）
+    支持拼多多和淘宝订单格式（自动检测）
     返回：{"success": bool, "message": str, "stats": dict, "changes": dict}
     """
     try:
-        # 1. 检查必要列是否存在
+        # ============================================================
+        # 🔧 第一步：检测平台类型（淘宝/拼多多），进行列映射
+        # ============================================================
+        platform = detect_platform(df)
+        print(f"🔍 检测到订单平台: {PLATFORM_NAMES.get(platform, platform)}")
+
+        mapping = PLATFORM_COLUMN_MAPPINGS.get(platform, {})
+        if mapping:
+            # 只保留存在的列进行重命名（平台列名 -> 标准列名）
+            existing_mapping = {k: v for k, v in mapping.items() if k in df.columns}
+            df = df.rename(columns=existing_mapping)
+            # 多个平台列可能映射到同一标准列（如 商品标题/商品名称 → 商品），
+            # 会产生重复列，导致后续 row[col] 返回 Series 报错；保留第一个即可
+            df = df.loc[:, ~df.columns.duplicated()]
+
+        # 淘宝无原生售后状态列，需根据订单状态/退款金额/发货收货时间合成
+        if platform == PLATFORM_TAOBAO:
+            df['售后状态'] = df.apply(gen_taobao_after_sale_status, axis=1)
+            # 删除临时列
+            df = df.drop(columns=['_temp_refund_amount', '_temp_close_reason'], errors='ignore')
+            # 商品标题为空时（淘宝关闭订单导出为空），从SKU规格提取花型名兜底
+            if '商品规格' in df.columns:
+                empty_prod = df['商品'].isna() & df['商品规格'].notna()
+                if empty_prod.any():
+                    df.loc[empty_prod, '商品'] = df.loc[empty_prod, '商品规格'].apply(extract_flower_from_spec)
+            print(f"✅ 淘宝格式映射完成，共 {len(df)} 行")
+        else:
+            print("🔍 拼多多格式直接处理")
+
+        # ============================================================
+        # 第二步：检查必要列是否存在
+        # ============================================================
         required_cols = ["订单号", "商品", "商家实收金额(元)"]
         missing = [col for col in required_cols if col not in df.columns]
         if missing:
@@ -449,7 +684,9 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
                 "changes": None,
             }
 
-        # 2. 检查 DataFrame 是否为空
+        # ============================================================
+        # 第三步：检查 DataFrame 是否为空
+        # ============================================================
         if df.empty:
             return {
                 "success": False,
@@ -458,12 +695,28 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
                 "changes": None,
             }
 
-        # 3. 按字段映射重命名
+        # 确保 data2026 有 platform 列（缺失时自动迁移）
+        ok, migrate_msg = ensure_platform_column()
+        if not ok:
+            return {
+                "success": False,
+                "message": migrate_msg,
+                "stats": {},
+                "changes": None,
+            }
+        if migrate_msg:
+            print(migrate_msg)
+
+        # ============================================================
+        # 第四步：按字段映射重命名（标准列名 -> 数据库字段名）
+        # ============================================================
         existing_cols = [col for col in COLUMN_MAPPING.keys() if col in df.columns]
         df = df[existing_cols]
         df = df.rename(columns=COLUMN_MAPPING)
 
-        # 3. 数据清洗
+        # ============================================================
+        # 第五步：数据清洗
+        # ============================================================
         for col in TEXT_COLUMNS:
             db_col = COLUMN_MAPPING.get(col)
             if db_col and db_col in df.columns:
@@ -481,34 +734,46 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
 
         # 删除全为空的行
         df = df.dropna(how='all')
+
         # 统一花型名称（将白底黑色条纹合并到白底乱纹）
         if 'product_spec' in df.columns:
             df['product_spec'] = df['product_spec'].astype(str).str.replace('白底黑色条纹', '白底乱纹', regex=False)
-        # 4. 添加默认字段
+
+        # ============================================================
+        # 第六步：添加默认字段
+        # ============================================================
         df["cost"] = 0.0
         df["meter"] = 0.0
         df["express_cost"] = 0.0
         df["traffic_cost"] = 0.0
         df["profit"] = 0.0
+        df["platform"] = platform
 
-        # 5. 统计信息
+        # ============================================================
+        # 第七步：统计信息
+        # ============================================================
         stats = {
             "总行数": len(df),
             "字段数": len(df.columns),
             "文件来源": filename
         }
 
-        # 6. 🔧 检测订单变化（在 UPSERT 之前对比新旧数据）
+        # ============================================================
+        # 第八步：检测订单变化（在 UPSERT 之前对比新旧数据）
+        # ============================================================
         changes = detect_order_changes(df)
 
-        # 7. UPSERT 到数据库
+        # ============================================================
+        # 第九步：UPSERT 到数据库
+        # ============================================================
         with engine.begin() as conn:
             total = 0
             for _, row in df.iterrows():
                 columns = list(row.index)
                 placeholders = ', '.join([f':{col}' for col in columns])
                 update_pairs = ', '.join(
-                    [f'{col} = VALUES({col})' for col in columns if col != 'id' and col != 'order_no'])
+                    [f'{col} = VALUES({col})' for col in columns if col != 'id' and col != 'order_no']
+                )
                 sql = f"""
                     INSERT INTO {orders} ({', '.join(columns)})
                     VALUES ({placeholders})
@@ -521,7 +786,7 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
                         params[col] = None
                     else:
                         params[col] = val
-                conn.execute(text(sql), params)
+                conn.execute(sqlalchemy.text(sql), params)
                 total += 1
 
         stats["成功导入"] = total

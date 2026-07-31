@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timedelta
 from sqlalchemy import text
 from mysql_conn import engine
-from import_order import orders
+from import_order import orders, PLATFORM_NAMES, extract_flower_from_spec
 from inventory_service import deduct_stock, get_missing_report_dates
 
 # ============================
@@ -21,22 +21,6 @@ POSTAGE_PER_ORDER = 2.5
 def ensure_output_dir():
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
-
-
-def extract_flower_from_spec(spec):
-    """从商品规格中提取花型（逗号或括号前的部分）"""
-    if pd.isna(spec):
-        return None
-    spec = str(spec).strip()
-    for sep in [',', '，']:
-        if sep in spec:
-            flower = spec.split(sep)[0].strip()
-            return flower if flower else None
-    for sep in ['（', '(']:
-        if sep in spec:
-            flower = spec.split(sep)[0].strip()
-            return flower if flower else None
-    return spec if spec else None
 
 
 def extract_meter_from_spec(spec):
@@ -165,11 +149,11 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # 读取当天订单
     # ============================================================
     query = text(f"""
-        SELECT 
-            id, order_no, product, product_spec, 
+        SELECT
+            id, order_no, product, product_spec,
             product_quantity, merchant_income,
             cost, meter, express_cost, traffic_cost, profit,
-            after_sale_status, order_status
+            after_sale_status, order_status, platform
         FROM {orders}
         WHERE DATE(delivery_time) = :target_date
           AND delivery_time IS NOT NULL
@@ -197,18 +181,31 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # ============================================================
     # 花型匹配（四层策略）
     # ============================================================
-    # 第一步：从规格提取
-    df['spec_flower'] = df['product_spec'].apply(extract_flower_from_spec)
-    df['花型'] = df['spec_flower'].apply(lambda x: x if x in cost_flowers else None)
-
     # ─── 花型标准化映射 ───
-    # 将“白底乱纹”和“白底黑色条纹”统一映射到“白底乱纹”
-    # 确保“白底乱纹”在成本表中存在
+    # 将同花型的不同叫法统一到成本表名称（含淘宝商品名与成本表差异）
     flower_alias_map = {
         '白底乱纹': '白底乱纹',
         '白底黑色条纹': '白底乱纹',
+        "几何乱纹":"白底乱纹",
+        # 淘宝商品名 → 成本表花型
+        '蓝色唐人': '唐人蓝色',
+        '紫色唐人': '唐人紫色',
+        '皮粉唐人': '唐人粉色',
+        '粉色唐人': '唐人粉色',
+        '黄色唐人': '黄色小唐人',
+        '水墨风蝴蝶': '水墨蝴蝶',
+        '雅韵青花': '青花雅韵',
+        '三色拼读': '三色拼写',
+        "黑底条纹":"城市条纹",
+        "黑白玄纹":"玄纹密码",
+        "条纹哪吒":"黄底哪吒",
+        "腰果花":"灰白底腰果花"
     }
-    df['花型'] = df['花型'].replace(flower_alias_map)
+    # 第一步：从规格提取（先做别名归一，再做成本表匹配）
+    df['spec_flower'] = df['product_spec'].apply(extract_flower_from_spec)
+    df['spec_flower'] = df['spec_flower'].replace(flower_alias_map)
+    df['花型'] = df['spec_flower'].apply(lambda x: x if x in cost_flowers else None)
+
     # 第二步：从商品名称匹配
     unmatched_mask = df['花型'].isna()
     if unmatched_mask.any():
@@ -310,6 +307,9 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
 
     df = matched_df
 
+    # 平台显示名（0=拼多多, 1=淘宝, 2=抖音；旧数据默认拼多多）
+    df['平台'] = df['platform'].map(PLATFORM_NAMES).fillna('拼多多')
+
     # ============================================================
     # 米数计算
     # ============================================================
@@ -387,7 +387,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # ============================================================
     # 明细表
     # ============================================================
-    detail_cols = ['花型', '成本', '米数', 'merchant_income', '快递费', '盈利',
+    detail_cols = ['花型', '平台', '成本', '米数', 'merchant_income', '快递费', '盈利',
                    'after_sale_status', 'order_no', 'product_spec', 'product_quantity', '是否退款']
     detail = detail_df[detail_cols].copy()
     detail = detail.rename(columns={
@@ -590,12 +590,14 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
         print("✅ 当天所有花型库存充足，无缺口")
 
     # ============================================================
-    # 汇总表
+    # 汇总表（按 花型×平台 分组，每花型含各平台分项 + "汇总"行，末尾总计）
     # ============================================================
+    summary_cols = ['花型', '平台', '订单数', '成本', '米数', '营业额', '快递费', '盈利']
     if normal_df.empty:
-        summary = pd.DataFrame(columns=['花型', '订单数', '成本', '米数', '营业额', '快递费', '盈利'])
+        summary = pd.DataFrame(columns=summary_cols)
     else:
-        summary = normal_df.groupby('花型').agg(
+        # 各花型 × 各平台分项
+        rows = normal_df.groupby(['花型', '平台'], dropna=False).agg(
             订单数=('order_no', 'nunique'),
             成本=('成本', 'sum'),
             米数=('米数', 'sum'),
@@ -603,12 +605,37 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
             快递费=('快递费', 'sum'),
             盈利=('盈利', 'sum')
         ).reset_index()
+
+        # 每花型汇总行
+        flower_total = normal_df.groupby('花型').agg(
+            订单数=('order_no', 'nunique'),
+            成本=('成本', 'sum'),
+            米数=('米数', 'sum'),
+            营业额=('merchant_income', 'sum'),
+            快递费=('快递费', 'sum'),
+            盈利=('盈利', 'sum')
+        ).reset_index()
+        flower_total['平台'] = '汇总'
+
+        summary = pd.concat([rows, flower_total], ignore_index=True)
         for col in ['成本', '米数', '营业额', '快递费', '盈利']:
             summary[col] = summary[col].round(2)
-        summary = summary.sort_values('营业额', ascending=False)
+
+        # 排序：花型按汇总营业额降序，平台按 拼多多→淘宝→抖音→汇总
+        platform_order = {name: i for i, name in enumerate(['拼多多', '淘宝', '抖音', '汇总'])}
+        flower_order = {
+            f: i for i, f in enumerate(
+                flower_total.sort_values('营业额', ascending=False)['花型']
+            )
+        }
+        summary['_fo'] = summary['花型'].map(flower_order)
+        summary['_po'] = summary['平台'].map(platform_order)
+        summary = summary.sort_values(['_fo', '_po']).drop(columns=['_fo', '_po'])
+        summary = summary[summary_cols]
 
     total_row = pd.DataFrame({
         '花型': ['【总计】'],
+        '平台': [''],
         '订单数': [len(normal_df)],
         '成本': [normal_df['成本'].sum().round(2)] if not normal_df.empty else [0],
         '米数': [normal_df['米数'].sum().round(2)] if not normal_df.empty else [0],
@@ -617,6 +644,38 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
         '盈利': [normal_df['盈利'].sum().round(2)] if not normal_df.empty else [0]
     })
     summary = pd.concat([summary, total_row], ignore_index=True)
+
+    # ============================================================
+    # 平台汇总表（拼多多/淘宝/抖音 三行齐全，无数据补 0，末尾合计）
+    # ============================================================
+    platform_rows = []
+    for name in ['拼多多', '淘宝', '抖音']:
+        sub = normal_df[normal_df['平台'] == name] if not normal_df.empty else pd.DataFrame()
+        if sub.empty:
+            platform_rows.append({
+                '平台': name, '订单数': 0, '成本': 0, '米数': 0,
+                '营业额': 0, '快递费': 0, '盈利': 0,
+            })
+        else:
+            platform_rows.append({
+                '平台': name,
+                '订单数': sub['order_no'].nunique(),
+                '成本': sub['成本'].sum().round(2),
+                '米数': sub['米数'].sum().round(2),
+                '营业额': sub['merchant_income'].sum().round(2),
+                '快递费': sub['快递费'].sum().round(2),
+                '盈利': sub['盈利'].sum().round(2),
+            })
+    platform_summary = pd.DataFrame(platform_rows)
+    platform_summary.loc[len(platform_summary)] = {
+        '平台': '合计',
+        '订单数': len(normal_df),
+        '成本': normal_df['成本'].sum().round(2) if not normal_df.empty else 0,
+        '米数': normal_df['米数'].sum().round(2) if not normal_df.empty else 0,
+        '营业额': normal_df['merchant_income'].sum().round(2) if not normal_df.empty else 0,
+        '快递费': normal_df['快递费'].sum().round(2) if not normal_df.empty else 0,
+        '盈利': normal_df['盈利'].sum().round(2) if not normal_df.empty else 0,
+    }
 
 
 
@@ -640,6 +699,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # ============================================================
     with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
         summary.to_excel(writer, sheet_name='花型汇总', index=False)
+        platform_summary.to_excel(writer, sheet_name='平台汇总', index=False)
         detail.to_excel(writer, sheet_name='订单明细', index=False)
 
         for sheet_name in writer.sheets:

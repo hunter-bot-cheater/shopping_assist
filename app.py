@@ -133,13 +133,13 @@ if menu == "🏠 首页":
 
 elif menu == "📤 导入订单":
     st.header("📤 导入订单 Excel")
-    st.info("💡 上传拼多多导出的订单明细 Excel 文件，系统会自动清洗并导入数据库")
+    st.info("💡 上传拼多多/淘宝导出的订单明细 Excel 文件，系统会自动识别平台并清洗导入")
 
     # 文件上传
     uploaded_file = st.file_uploader(
         "选择 Excel 文件",
-        type=["xlsx", "xls"],
-        help="支持 .xlsx 和 .xls 格式，文件需包含订单号、商品、商家实收金额等列"
+        type=["xlsx", "xls","csv"],
+        help="支持 .xlsx/.xls/.csv，拼多多（订单号/商品/商家实收金额）或淘宝（订单编号/商品标题/确认收货打款金额）格式，自动识别"
     )
 
     if uploaded_file is not None:
@@ -157,13 +157,6 @@ elif menu == "📤 导入订单":
                     # 显示预览
                     st.subheader("📋 数据预览（前5行）")
                     st.dataframe(df.head())
-
-                    # 检查必要列
-                    required_cols = ["订单号", "商品", "商家实收金额(元)"]
-                    missing = [col for col in required_cols if col not in df.columns]
-                    if missing:
-                        st.error(f"❌ 缺少必要列：{missing}")
-                        st.stop()
 
                     with st.spinner("正在导入数据..."):
                         # 调用导入函数（需要从 import_order 导入）

@@ -1,5 +1,20 @@
 多人协作开发操作手册.md
 
+#测试相关
+_analyze_taobao.py
+_check_pdd_xlsx.py
+_check_taobao_daily.py
+_compare_0711_table.py
+_debug_flower_match.py
+_find_264.py
+_fix_and_verify.py
+_reproduce_0711.py
+_test_upload.py
+_verify_alias.py
+alter_table_add_platform.sql
+migrate_platform.py
+
+
 #.coverage相关
 .coverage
 .coverage.*

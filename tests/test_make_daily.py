@@ -103,6 +103,7 @@ class TestGenerateDailyReport:
                 'profit': [0.0, 0.0],
                 'after_sale_status': ['', ''],
                 'order_status': ['已发货', '已发货'],
+                'platform': [0, 1],
             }),
         ]
 
@@ -123,6 +124,74 @@ def _make_mock_connection():
     conn.execute.return_value.fetchone.return_value = None
     conn.__enter__.return_value = conn  # Python 3.12+ __enter__ no longer returns self
     return conn
+
+
+# ===========================================================================
+# 平台分组（真实 Excel 写入 tmp_path）
+# ===========================================================================
+
+class TestPlatformGrouping:
+
+    def test_summary_grouped_by_platform(self, tmp_path):
+        """花型汇总按平台分行；平台汇总 sheet 三平台齐全；明细含平台列。"""
+        order_df = pd.DataFrame({
+            'id': [1, 2],
+            'order_no': ['ORD001', 'ORD002'],
+            'product': ['花型A布料', '花型B布料'],
+            'product_spec': ['花型A,2米', '花型B,3米'],
+            'product_quantity': [1, 1],
+            'merchant_income': [50.0, 90.0],
+            'cost': [0.0, 0.0],
+            'meter': [0.0, 0.0],
+            'express_cost': [0.0, 0.0],
+            'traffic_cost': [0.0, 0.0],
+            'profit': [0.0, 0.0],
+            'after_sale_status': ['', ''],
+            'order_status': ['已发货', '已发货'],
+            'platform': [0, 1],  # 拼多多 + 淘宝
+        })
+
+        with patch('make_daily.OUTPUT_DIR', str(tmp_path)), \
+             patch('make_daily.engine') as mock_engine, \
+             patch('pandas.read_sql') as mock_read_sql, \
+             patch('make_daily.load_cost_map',
+                   return_value={'花型A': 10.0, '花型B': 15.5}), \
+             patch('make_daily.deduct_stock'), \
+             patch('inventory_service.fill_missing_snapshots') as mock_fill, \
+             patch('inventory_service.get_missing_report_dates', return_value=[]):
+
+            mock_read_sql.side_effect = [order_df]
+            mock_engine.connect.return_value = _make_mock_connection()
+            mock_fill.return_value = (0, 'already_latest', '已最新')
+
+            result = generate_daily_report('2026-07-15')
+            assert isinstance(result, str) and result.endswith('.xlsx')
+
+            xlsx_files = list(tmp_path.glob('*.xlsx'))
+            assert len(xlsx_files) == 1
+
+            with pd.ExcelFile(xlsx_files[0]) as xf:
+                assert set(xf.sheet_names) == {'花型汇总', '平台汇总', '订单明细'}
+
+                # 花型汇总：各平台分项 + 汇总行 + 总计行
+                summary = pd.read_excel(xf, '花型汇总')
+                assert '平台' in summary.columns
+                assert '拼多多' in summary['平台'].tolist()
+                assert '淘宝' in summary['平台'].tolist()
+                assert '汇总' in summary['平台'].tolist()
+                assert '【总计】' in summary['花型'].tolist()
+                assert '抖音' not in summary['平台'].tolist()  # 无抖音数据，不分项
+
+                # 平台汇总：拼多多/淘宝/抖音 三行齐全（无数据补 0）+ 合计
+                ps = pd.read_excel(xf, '平台汇总')
+                assert ps['平台'].tolist() == ['拼多多', '淘宝', '抖音', '合计']
+                douyin_row = ps[ps['平台'] == '抖音'].iloc[0]
+                assert douyin_row['订单数'] == 0
+                assert douyin_row['营业额'] == 0
+
+                # 订单明细含平台列
+                detail = pd.read_excel(xf, '订单明细')
+                assert '平台' in detail.columns
 
 
 # ===========================================================================

@@ -19,7 +19,7 @@ def sync_refund_details():
                     after_sale_status,
                     order_time
                 FROM data2026
-                WHERE (order_status LIKE '%已发货%' or order_status LIKE '%已收货%')
+                WHERE (order_status LIKE '%已发货%' or order_status LIKE '%已收货%' OR order_status = '交易关闭')
                   AND after_sale_status LIKE '%退款成功%'
             """),
             conn
