@@ -139,7 +139,7 @@ elif menu == "📤 导入订单":
     uploaded_file = st.file_uploader(
         "选择 Excel 文件",
         type=["xlsx", "xls","csv"],
-        help="支持 .xlsx/.xls/.csv，拼多多（订单号/商品/商家实收金额）或淘宝（订单编号/商品标题/确认收货打款金额）格式，自动识别"
+        help="支持 .xlsx/.xls/.csv，拼多多（订单号/商品/商家实收金额）或淘宝（订单编号/商品标题/买家应付货款）格式，自动识别"
     )
 
     if uploaded_file is not None:
@@ -151,8 +151,13 @@ elif menu == "📤 导入订单":
         with col1:
             if st.button("🚀 开始导入", type="primary", use_container_width=True):
                 try:
-                    # 读取上传的文件
-                    df = pd.read_excel(uploaded_file, sheet_name=0)
+                    import io
+
+                    file_content = uploaded_file.read()
+                    if uploaded_file.name.endswith('.csv'):
+                        df = pd.read_csv(io.BytesIO(file_content))
+                    else:
+                        df = pd.read_excel(io.BytesIO(file_content), sheet_name=0, engine='openpyxl')
 
                     # 显示预览
                     st.subheader("📋 数据预览（前5行）")
@@ -577,23 +582,37 @@ elif menu == "📊 日报中心":
 
     st.divider()
 
-    # ---------- 近7天销量趋势 ----------
-    st.subheader("📈 近7天销量趋势")
-    with engine.connect() as conn:
-        trend = pd.read_sql(
-            text("""
-                SELECT report_date, flower, total_meters
-                FROM daily_report_cache
-                WHERE report_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
-                ORDER BY report_date, total_meters DESC
-            """),
-            conn
-        )
-    if not trend.empty:
-        pivot = trend.pivot(index='report_date', columns='flower', values='total_meters').fillna(0)
-        st.line_chart(pivot)
-    else:
-        st.info("暂无日报缓存数据，请先生成日报")
+    # ---------- 生成区间报告 ----------
+    st.subheader("📅 生成区间报告")
+    st.info("💡 生成指定日期范围内的汇总报表（口径与日报一致：只要发货/收货且不退款即计入，仅排除退款与已取消订单）")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        range_start = st.date_input("开始日期", value=date(2026, 7, 1))
+    with col2:
+        range_end = st.date_input("结束日期", value=date.today())
+
+    if st.button("🚀 生成区间报告", type="primary"):
+        from make_daily import generate_range_report
+
+        start_str = range_start.strftime("%Y-%m-%d")
+        end_str = range_end.strftime("%Y-%m-%d")
+        with st.spinner(f"正在生成 {start_str} 至 {end_str} 的区间报告..."):
+            try:
+                filepath = generate_range_report(start_str, end_str, force=True)
+                if filepath and os.path.exists(filepath):
+                    st.success("✅ 区间报告生成成功！")
+                    with open(filepath, "rb") as f:
+                        st.download_button(
+                            label="📥 下载区间报告 Excel",
+                            data=f,
+                            file_name=os.path.basename(filepath),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                else:
+                    st.warning(f"生成完成，但未找到文件，请检查目录：{filepath}")
+            except Exception as e:
+                st.error(f"❌ 生成失败：{e}")
 
 
 elif menu == "⚙️ 库存调整":

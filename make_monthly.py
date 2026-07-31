@@ -10,7 +10,8 @@ from sqlalchemy import text
 
 from mysql_conn import engine
 
-from import_order import orders
+from import_order import orders, PLATFORM_NAMES
+from make_daily import build_platform_summary, build_platform_totals, write_summary_sheet, _auto_width_sheets
 # ==========================================================
 # 配置
 # ==========================================================
@@ -422,6 +423,8 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
 
             order_status,
 
+            platform,
+
             delivery_time
 
 
@@ -510,6 +513,10 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
         f"📋 时间范围订单数量:{len(df)} 条"
 
     )
+
+
+    # 平台显示名（0=拼多多, 1=淘宝, 2=抖音；旧数据默认拼多多）
+    df['平台'] = df['platform'].map(PLATFORM_NAMES).fillna('拼多多')
 
 
 
@@ -1087,6 +1094,8 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
 
         '花型',
 
+        '平台',
+
         '成本',
 
         '米数',
@@ -1147,7 +1156,8 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
 
 
     # ==========================================================
-    # 月报花型汇总
+    # ==========================================================
+    # 月报花型汇总（左右分列：花型 | 拼多多6列 | 空2列 | 淘宝6列 | 空2列 | 汇总6列）
     # ==========================================================
 
 
@@ -1157,217 +1167,8 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
 
     ]
 
-
-
-    if normal_df.empty:
-
-
-        summary=pd.DataFrame(
-
-            columns=[
-
-                '花型',
-
-                '订单数',
-
-                '成本',
-
-                '米数',
-
-                '营业额',
-
-                '快递费',
-
-                '盈利'
-
-            ]
-
-        )
-
-
-
-    else:
-
-
-        summary=normal_df.groupby(
-
-            '花型'
-
-        ).agg(
-
-
-            订单数=(
-
-                'order_no',
-
-                'count'
-
-            ),
-
-
-
-            成本=(
-
-                '成本',
-
-                'sum'
-
-            ),
-
-
-
-            米数=(
-
-                '米数',
-
-                'sum'
-
-            ),
-
-
-
-            营业额=(
-
-                'merchant_income',
-
-                'sum'
-
-            ),
-
-
-
-            快递费=(
-
-                '快递费',
-
-                'sum'
-
-            ),
-
-
-
-            盈利=(
-
-                '盈利',
-
-                'sum'
-
-            )
-
-        ).reset_index()
-
-
-
-
-
-        for col in [
-
-            '成本',
-
-            '米数',
-
-            '营业额',
-
-            '快递费',
-
-            '盈利'
-
-        ]:
-
-
-            summary[col]=summary[col].round(2)
-
-
-
-
-
-        summary=summary.sort_values(
-
-            by='营业额',
-
-            ascending=False
-
-        )
-
-
-
-
-
-
-
-    # ==========================================================
-    # 月报总计
-    # ==========================================================
-
-
-    total_row=pd.DataFrame({
-
-        '花型':[
-
-            '【月度总计】'
-
-        ],
-
-
-        '订单数':[
-
-            len(normal_df)
-
-        ],
-
-
-        '成本':[
-
-            normal_df['成本'].sum().round(2)
-
-        ],
-
-
-        '米数':[
-
-            normal_df['米数'].sum().round(2)
-
-        ],
-
-
-        '营业额':[
-
-            normal_df['merchant_income'].sum().round(2)
-
-        ],
-
-
-        '快递费':[
-
-            normal_df['快递费'].sum().round(2)
-
-        ],
-
-
-        '盈利':[
-
-            normal_df['盈利'].sum().round(2)
-
-        ]
-
-    })
-
-
-
-    summary=pd.concat(
-
-        [
-
-            summary,
-
-            total_row
-
-        ],
-
-        ignore_index=True
-
-    )
-
+    summary_wide = build_platform_summary(normal_df, total_label="【月度总计】")
+    platform_summary = build_platform_totals(normal_df)
 
 
 
@@ -1477,95 +1278,14 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
 
     ) as writer:
 
-
-
-        summary.to_excel(
-
-            writer,
-
-            sheet_name='花型汇总',
-
-            index=False
-
-        )
-
-
-
-        detail.to_excel(
-
-            writer,
-
-            sheet_name='订单明细',
-
-            index=False
-
-        )
-
-
-
-
-
-        # 自动调整列宽
-
-
-        for sheet_name in writer.sheets:
-
-
-
-            worksheet=writer.sheets[sheet_name]
-
-
-
-            for column in worksheet.columns:
-
-
-
-                max_length=0
-
-
-
-                column_letter=column[0].column_letter
-
-
-
-                for cell in column:
-
-
-                    try:
-
-                        if len(str(cell.value))>max_length:
-
-                            max_length=len(str(cell.value))
-
-
-                    except:
-
-                        pass
-
-
-
-                worksheet.column_dimensions[
-
-                    column_letter
-
-                ].width=min(
-
-                    max_length+2,
-
-                    30
-
-                )
-
-
-
-
+        write_summary_sheet(writer, summary_wide, sheet_name="花型汇总")
+        platform_summary.to_excel(writer, sheet_name="平台汇总", index=False)
+        detail.to_excel(writer, sheet_name="订单明细", index=False)
+        _auto_width_sheets(writer)
 
     print(
-
         f"✅ 月报生成成功:{filepath}"
-
     )
-
 
     return filepath
 

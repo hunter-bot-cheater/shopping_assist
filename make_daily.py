@@ -14,6 +14,13 @@ from inventory_service import deduct_stock, get_missing_report_dates
 OUTPUT_DIR = r"D:\店铺\日报"
 POSTAGE_PER_ORDER = 2.5
 
+# 汇总表指标列（顺序固定：订单数、成本、米数、营业额、快递费、盈利）
+SUMMARY_METRICS = ['订单数', '成本', '米数', '营业额', '快递费', '盈利']
+# 花型汇总左右分列展示的平台（新增平台在此追加，如 '抖音'）
+SUMMARY_PLATFORMS = ('拼多多', '淘宝')
+# 平台汇总表始终展示的平台（无数据补 0）
+PLATFORM_SUMMARY_NAMES = ('拼多多', '淘宝', '抖音')
+
 
 # ============================
 # 工具函数
@@ -78,109 +85,16 @@ def load_cost_map(report_date=None):
         print(f"加载成本表失败: {e}")
         return {}
 # ============================
-# 主函数
+# 花型匹配与计算（日报/区间报告共用，保证口径一致）
 # ============================
-def generate_daily_report(target_date=None, force=True, orders=orders):
+def _match_flowers_and_calc(df, cost_map):
+    """花型四层匹配 + 米数/成本/快递费/盈利 + 退款标记 + 平台名。
+
+    返回 (df, matched_count, unmatched_count)；无匹配订单时 df 为 None。
     """
-    生成日报（默认强制覆盖）
-    force=True：强制重新生成，先回退旧库存，再重新扣减
-    """
-    ensure_output_dir()
-
-    if target_date is None:
-        target_dt = datetime.now()
-    else:
-        try:
-            target_dt = datetime.strptime(target_date, '%Y-%m-%d')
-        except ValueError:
-            print(f"日期格式错误: {target_date}，请使用 YYYY-MM-DD 格式")
-            return
-
-    target_date = target_dt.strftime('%Y-%m-%d')
-    filename = f"{target_dt.strftime('%Y%m%d')}日报.xlsx"
-    filepath = os.path.join(OUTPUT_DIR, filename)
-
-    # ============================================================
-    # 🔧 改进：读取旧缓存用于对比，但不回退库存（改用增量扣减）
-    # ============================================================
-    old_data = None
-    with engine.connect() as conn:
-        # 1. 检查是否有旧缓存，并读取旧数据用于对比
-        existing = conn.execute(
-            text("SELECT COUNT(*) FROM daily_report_cache WHERE report_date = :d"),
-            {"d": target_date}
-        ).scalar()
-
-        if existing > 0:
-            old_data = pd.read_sql(
-                text("SELECT flower, total_meters, revenue, profit FROM daily_report_cache WHERE report_date = :d"),
-                conn,
-                params={"d": target_date}
-            )
-            if not old_data.empty:
-                old_data = old_data.set_index('flower').to_dict(orient='index')
-            else:
-                old_data = {}
-            print(f"📊 检测到 {target_date} 已有日报缓存")
-        else:
-            old_data = {}
-            print(f"📝 {target_date} 首次生成日报")
-
-        # 2. 🔧 不再自动回退库存，改为增量扣减（见下方扣减逻辑）
-        # 只清理缓存数据，库存变动记录保留用于增量计算
-
-        # 3. 删除所有旧缓存（确保插入时不会唯一键冲突）
-        conn.execute(
-            text("DELETE FROM daily_report_cache WHERE report_date = :d"),
-            {"d": target_date}
-        )
-        conn.execute(
-            text("DELETE FROM daily_report_meta WHERE report_date = :d"),
-            {"d": target_date}
-        )
-        conn.execute(
-            text("DELETE FROM inventory_shortfall WHERE reference_date = :d"),
-            {"d": target_date}
-        )
-        conn.commit()
-        print(f"✅ 已清理 {target_date} 的所有旧缓存数据")
-
-    # ============================================================
-    # 读取当天订单
-    # ============================================================
-    query = text(f"""
-        SELECT
-            id, order_no, product, product_spec,
-            product_quantity, merchant_income,
-            cost, meter, express_cost, traffic_cost, profit,
-            after_sale_status, order_status, platform
-        FROM {orders}
-        WHERE DATE(delivery_time) = :target_date
-          AND delivery_time IS NOT NULL
-    """)
-
-    try:
-        with engine.connect() as conn:
-            df = pd.read_sql(query, conn, params={"target_date": target_date})
-    except Exception as e:
-        print(f"读取数据库失败: {e}")
-        return
-
-    if df.empty:
-        print(f"⚠️ {target_date} 没有订单数据，无需生成日报")
-        return
-
-    original_count = len(df)
-    print(f"📋 原始订单数: {original_count}")
-
-    # 加载成本表
-    cost_map = load_cost_map(target_date)
     cost_flowers = set(cost_map.keys())
-    print(f"📚 成本表中有 {len(cost_map)} 个花型")
+    df = df.copy()
 
-    # ============================================================
-    # 花型匹配（四层策略）
-    # ============================================================
     # ─── 花型标准化映射 ───
     # 将同花型的不同叫法统一到成本表名称（含淘宝商品名与成本表差异）
     flower_alias_map = {
@@ -291,10 +205,8 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     else:
         print("✅ 所有订单均成功匹配花型！")
 
-    # 过滤未匹配
     matched_df = df[df['花型'].isin(cost_flowers)].copy()
     unmatched_df = df[~df['花型'].isin(cost_flowers)].copy()
-
     matched_count = len(matched_df)
     unmatched_count = len(unmatched_df)
     print(f"✅ 匹配成功: {matched_count} 条")
@@ -302,8 +214,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
         print(f"⚠️ 未匹配（将被过滤）: {unmatched_count} 条")
 
     if matched_df.empty:
-        print(f"❌ 没有匹配成功的订单，无法生成日报")
-        return
+        return None, matched_count, unmatched_count
 
     df = matched_df
 
@@ -339,6 +250,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
                 ]
             ].to_string(index=False)
         )
+
     # ============================================================
     # 成本计算
     # ============================================================
@@ -357,6 +269,325 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # 退款标记
     # ============================================================
     df['是否退款'] = df['after_sale_status'].astype(str).str.contains('退款成功', na=False)
+
+    return df, matched_count, unmatched_count
+
+
+# ============================
+# 汇总表构建（日报/区间报告/月报共用）
+# ============================
+def _wide_columns(platform_names):
+    """左右分列宽表列名：花型 + 每平台6指标(间空2列) + 汇总6指标。"""
+    cols = ['花型']
+    for i, p in enumerate(platform_names):
+        cols += [f'{p}_{m}' for m in SUMMARY_METRICS]
+        cols += [f'_spacer_{i}_1', f'_spacer_{i}_2']
+    cols += [f'汇总_{m}' for m in SUMMARY_METRICS]
+    return cols
+
+
+def build_platform_summary(normal_df, platform_names=SUMMARY_PLATFORMS, total_label='【总计】'):
+    """构建左右分列的宽表汇总。
+
+    行 = 花型（按汇总营业额降序）+ 末尾总计行；
+    列 = 花型 | 拼多多6列 | 空2列 | 淘宝6列 | 空2列 | 汇总6列。
+    返回扁平列名的 DataFrame，合并表头由 write_summary_sheet 写入。
+    """
+    def block(flowers_df):
+        if flowers_df is None or flowers_df.empty:
+            return {}
+        g = flowers_df.groupby('花型', dropna=False).agg(
+            订单数=('order_no', 'nunique'),
+            成本=('成本', 'sum'),
+            米数=('米数', 'sum'),
+            营业额=('merchant_income', 'sum'),
+            快递费=('快递费', 'sum'),
+            盈利=('盈利', 'sum')
+        ).round(2)
+        return g.to_dict(orient='index')
+
+    cols = _wide_columns(platform_names)
+    if normal_df is None or normal_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    total = block(normal_df)
+    # 花型按汇总营业额降序
+    flower_order = sorted(total.keys(), key=lambda f: total[f]['营业额'], reverse=True)
+
+    per_platform = {p: block(normal_df[normal_df['平台'] == p]) for p in platform_names}
+
+    rows = []
+    for flower in flower_order:
+        row = {'花型': flower}
+        for i, p in enumerate(platform_names):
+            fb = per_platform[p].get(flower, {})
+            for m in SUMMARY_METRICS:
+                row[f'{p}_{m}'] = fb.get(m, 0)
+            row[f'_spacer_{i}_1'] = ''
+            row[f'_spacer_{i}_2'] = ''
+        for m in SUMMARY_METRICS:
+            row[f'汇总_{m}'] = total[flower][m]
+        rows.append(row)
+
+    # 总计行
+    def raw_col(m):
+        return 'merchant_income' if m == '营业额' else m
+
+    tot = {'花型': total_label}
+    for i, p in enumerate(platform_names):
+        sub = normal_df[normal_df['平台'] == p]
+        tot[f'{p}_订单数'] = sub['order_no'].nunique() if not sub.empty else 0
+        for m in SUMMARY_METRICS[1:]:
+            tot[f'{p}_{m}'] = round(sub[raw_col(m)].sum(), 2) if not sub.empty else 0
+        tot[f'_spacer_{i}_1'] = ''
+        tot[f'_spacer_{i}_2'] = ''
+    tot['汇总_订单数'] = len(normal_df)
+    for m in SUMMARY_METRICS[1:]:
+        tot[f'汇总_{m}'] = round(normal_df[raw_col(m)].sum(), 2)
+    rows.append(tot)
+
+    return pd.DataFrame(rows, columns=cols)
+
+
+def build_platform_totals(normal_df, platform_names=PLATFORM_SUMMARY_NAMES):
+    """平台汇总表：指定平台三行齐全（无数据补 0），末尾合计。"""
+    def row(name, sub):
+        return {
+            '平台': name,
+            '订单数': sub['order_no'].nunique() if not sub.empty else 0,
+            '成本': round(sub['成本'].sum(), 2) if not sub.empty else 0,
+            '米数': round(sub['米数'].sum(), 2) if not sub.empty else 0,
+            '营业额': round(sub['merchant_income'].sum(), 2) if not sub.empty else 0,
+            '快递费': round(sub['快递费'].sum(), 2) if not sub.empty else 0,
+            '盈利': round(sub['盈利'].sum(), 2) if not sub.empty else 0,
+        }
+
+    if normal_df is None or normal_df.empty:
+        rows = [row(n, pd.DataFrame()) for n in platform_names]
+        rows.append({'平台': '合计', '订单数': 0, '成本': 0, '米数': 0, '营业额': 0, '快递费': 0, '盈利': 0})
+        return pd.DataFrame(rows)
+
+    rows = [row(n, normal_df[normal_df['平台'] == n]) for n in platform_names]
+    rows.append({
+        '平台': '合计',
+        '订单数': len(normal_df),
+        '成本': round(normal_df['成本'].sum(), 2),
+        '米数': round(normal_df['米数'].sum(), 2),
+        '营业额': round(normal_df['merchant_income'].sum(), 2),
+        '快递费': round(normal_df['快递费'].sum(), 2),
+        '盈利': round(normal_df['盈利'].sum(), 2),
+    })
+    return pd.DataFrame(rows)
+
+
+def write_summary_sheet(writer, summary_wide, sheet_name='花型汇总'):
+    """把左右分列宽表汇总写入 Excel：第1行平台合并表头，第2行指标名，数据从第3行起，总计行加粗。"""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    summary_wide.to_excel(writer, sheet_name=sheet_name, index=False, header=False, startrow=2)
+    if sheet_name in writer.sheets:
+        ws = writer.sheets[sheet_name]
+    else:
+        ws = writer.book.create_sheet(sheet_name)
+        writer.sheets[sheet_name] = ws
+
+    cols = list(summary_wide.columns)
+
+    # 按列名前缀分组：'拼多多_订单数' → 平台段 '拼多多'；'_spacer_0_1' → 空段
+    def group_key(c):
+        if c.startswith('_spacer_'):
+            return c.rsplit('_', 1)[0]  # '_spacer_0' 每平台独立空段
+        return c.split('_')[0]
+
+    groups = []
+    for c in cols[1:]:
+        key = group_key(c)
+        if groups and groups[-1][0] == key:
+            groups[-1][1].append(c)
+        else:
+            groups.append((key, [c]))
+
+    thin = Side(style='thin', color='000000')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_fill = PatternFill('solid', fgColor='D9E1F2')
+    title_font = Font(bold=True)
+    center = Alignment(horizontal='center', vertical='center')
+
+    # 花型表头（合并 A1:A2）
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+    ws.cell(row=1, column=1, value='花型')
+    ws.cell(row=1, column=1).font = title_font
+    ws.cell(row=1, column=1).alignment = center
+    ws.cell(row=1, column=1).fill = header_fill
+    ws.cell(row=1, column=1).border = border
+
+    col_idx = 1  # A 列（花型）
+    for key, gc in groups:
+        start = col_idx + 1
+        end = col_idx + len(gc)
+        is_platform = not key.startswith('_spacer_')
+        # 第1行：平台名（合并段），空段留白
+        ws.merge_cells(start_row=1, start_column=start, end_row=1, end_column=end)
+        if is_platform:
+            ws.cell(row=1, column=start, value=key)
+        for j in range(start, end + 1):
+            cell = ws.cell(row=1, column=j)
+            if is_platform:
+                cell.font = title_font
+                cell.alignment = center
+                cell.fill = header_fill
+            cell.border = border
+        # 第2行：指标名
+        for j, c in enumerate(gc):
+            cell = ws.cell(row=2, column=start + j)
+            if is_platform:
+                cell.value = c.split('_', 1)[1]
+                cell.font = title_font
+                cell.alignment = center
+                cell.fill = header_fill
+            cell.border = border
+        col_idx = end
+
+    # 数据行边框 + 总计行加粗（总计行由 build_platform_summary 追加在最后）
+    n_data = len(summary_wide)
+    last_data_row = 2 + n_data
+    for r in range(3, 3 + n_data):
+        is_total = (r == last_data_row)
+        for c in range(1, len(cols) + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.border = border
+            if is_total:
+                cell.font = Font(bold=True)
+
+
+def _auto_width_sheets(writer):
+    from openpyxl.utils import get_column_letter
+    for sheet_name in writer.sheets:
+        worksheet = writer.sheets[sheet_name]
+        for col_idx in range(1, worksheet.max_column + 1):
+            column_letter = get_column_letter(col_idx)
+            max_length = 0
+            for cell in worksheet[column_letter]:
+                if cell.value is None:
+                    continue
+                try:
+                    length = len(str(cell.value))
+                except Exception:
+                    continue
+                if length > max_length:
+                    max_length = length
+            adjusted_width = min(max_length + 2, 30)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+
+
+# ============================
+# 主函数
+# ============================
+def generate_daily_report(target_date=None, force=True, orders=orders):
+    """
+    生成日报（默认强制覆盖）
+    force=True：强制重新生成，先回退旧库存，再重新扣减
+    """
+    ensure_output_dir()
+
+    if target_date is None:
+        target_dt = datetime.now()
+    else:
+        try:
+            target_dt = datetime.strptime(target_date, '%Y-%m-%d')
+        except ValueError:
+            print(f"日期格式错误: {target_date}，请使用 YYYY-MM-DD 格式")
+            return
+
+    target_date = target_dt.strftime('%Y-%m-%d')
+    filename = f"{target_dt.strftime('%Y%m%d')}日报.xlsx"
+    filepath = os.path.join(OUTPUT_DIR, filename)
+
+    # ============================================================
+    # 🔧 改进：读取旧缓存用于对比，但不回退库存（改用增量扣减）
+    # ============================================================
+    old_data = None
+    with engine.connect() as conn:
+        # 1. 检查是否有旧缓存，并读取旧数据用于对比
+        existing = conn.execute(
+            text("SELECT COUNT(*) FROM daily_report_cache WHERE report_date = :d"),
+            {"d": target_date}
+        ).scalar()
+
+        if existing > 0:
+            old_data = pd.read_sql(
+                text("SELECT flower, total_meters, revenue, profit FROM daily_report_cache WHERE report_date = :d"),
+                conn,
+                params={"d": target_date}
+            )
+            if not old_data.empty:
+                old_data = old_data.set_index('flower').to_dict(orient='index')
+            else:
+                old_data = {}
+            print(f"📊 检测到 {target_date} 已有日报缓存")
+        else:
+            old_data = {}
+            print(f"📝 {target_date} 首次生成日报")
+
+        # 2. 🔧 不再自动回退库存，改为增量扣减（见下方扣减逻辑）
+        # 只清理缓存数据，库存变动记录保留用于增量计算
+
+        # 3. 删除所有旧缓存（确保插入时不会唯一键冲突）
+        conn.execute(
+            text("DELETE FROM daily_report_cache WHERE report_date = :d"),
+            {"d": target_date}
+        )
+        conn.execute(
+            text("DELETE FROM daily_report_meta WHERE report_date = :d"),
+            {"d": target_date}
+        )
+        conn.execute(
+            text("DELETE FROM inventory_shortfall WHERE reference_date = :d"),
+            {"d": target_date}
+        )
+        conn.commit()
+        print(f"✅ 已清理 {target_date} 的所有旧缓存数据")
+
+    # ============================================================
+    # 读取当天订单
+    # ============================================================
+    query = text(f"""
+        SELECT
+            id, order_no, product, product_spec,
+            product_quantity, merchant_income,
+            cost, meter, express_cost, traffic_cost, profit,
+            after_sale_status, order_status, platform
+        FROM {orders}
+        WHERE DATE(delivery_time) = :target_date
+          AND delivery_time IS NOT NULL
+    """)
+
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={"target_date": target_date})
+    except Exception as e:
+        print(f"读取数据库失败: {e}")
+        return
+
+    if df.empty:
+        print(f"⚠️ {target_date} 没有订单数据，无需生成日报")
+        return
+
+    original_count = len(df)
+    print(f"📋 原始订单数: {original_count}")
+
+    # 加载成本表
+    cost_map = load_cost_map(target_date)
+    cost_flowers = set(cost_map.keys())
+    print(f"📚 成本表中有 {len(cost_map)} 个花型")
+
+    # ============================================================
+    # 花型匹配 + 米数/成本/快递费/盈利 + 退款标记（共用函数，日报与区间报告口径一致）
+    # ============================================================
+    df, matched_count, unmatched_count = _match_flowers_and_calc(df, cost_map)
+    if df is None:
+        print(f"❌ 没有匹配成功的订单，无法生成日报")
+        return
 
     # ============================================================
     # 正常订单（汇总表用：排除所有退款和取消）
@@ -590,92 +821,10 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
         print("✅ 当天所有花型库存充足，无缺口")
 
     # ============================================================
-    # 汇总表（按 花型×平台 分组，每花型含各平台分项 + "汇总"行，末尾总计）
+    # 汇总表（左右分列：花型 | 拼多多6列 | 空2列 | 淘宝6列 | 空2列 | 汇总6列）
     # ============================================================
-    summary_cols = ['花型', '平台', '订单数', '成本', '米数', '营业额', '快递费', '盈利']
-    if normal_df.empty:
-        summary = pd.DataFrame(columns=summary_cols)
-    else:
-        # 各花型 × 各平台分项
-        rows = normal_df.groupby(['花型', '平台'], dropna=False).agg(
-            订单数=('order_no', 'nunique'),
-            成本=('成本', 'sum'),
-            米数=('米数', 'sum'),
-            营业额=('merchant_income', 'sum'),
-            快递费=('快递费', 'sum'),
-            盈利=('盈利', 'sum')
-        ).reset_index()
-
-        # 每花型汇总行
-        flower_total = normal_df.groupby('花型').agg(
-            订单数=('order_no', 'nunique'),
-            成本=('成本', 'sum'),
-            米数=('米数', 'sum'),
-            营业额=('merchant_income', 'sum'),
-            快递费=('快递费', 'sum'),
-            盈利=('盈利', 'sum')
-        ).reset_index()
-        flower_total['平台'] = '汇总'
-
-        summary = pd.concat([rows, flower_total], ignore_index=True)
-        for col in ['成本', '米数', '营业额', '快递费', '盈利']:
-            summary[col] = summary[col].round(2)
-
-        # 排序：花型按汇总营业额降序，平台按 拼多多→淘宝→抖音→汇总
-        platform_order = {name: i for i, name in enumerate(['拼多多', '淘宝', '抖音', '汇总'])}
-        flower_order = {
-            f: i for i, f in enumerate(
-                flower_total.sort_values('营业额', ascending=False)['花型']
-            )
-        }
-        summary['_fo'] = summary['花型'].map(flower_order)
-        summary['_po'] = summary['平台'].map(platform_order)
-        summary = summary.sort_values(['_fo', '_po']).drop(columns=['_fo', '_po'])
-        summary = summary[summary_cols]
-
-    total_row = pd.DataFrame({
-        '花型': ['【总计】'],
-        '平台': [''],
-        '订单数': [len(normal_df)],
-        '成本': [normal_df['成本'].sum().round(2)] if not normal_df.empty else [0],
-        '米数': [normal_df['米数'].sum().round(2)] if not normal_df.empty else [0],
-        '营业额': [normal_df['merchant_income'].sum().round(2)] if not normal_df.empty else [0],
-        '快递费': [normal_df['快递费'].sum().round(2)] if not normal_df.empty else [0],
-        '盈利': [normal_df['盈利'].sum().round(2)] if not normal_df.empty else [0]
-    })
-    summary = pd.concat([summary, total_row], ignore_index=True)
-
-    # ============================================================
-    # 平台汇总表（拼多多/淘宝/抖音 三行齐全，无数据补 0，末尾合计）
-    # ============================================================
-    platform_rows = []
-    for name in ['拼多多', '淘宝', '抖音']:
-        sub = normal_df[normal_df['平台'] == name] if not normal_df.empty else pd.DataFrame()
-        if sub.empty:
-            platform_rows.append({
-                '平台': name, '订单数': 0, '成本': 0, '米数': 0,
-                '营业额': 0, '快递费': 0, '盈利': 0,
-            })
-        else:
-            platform_rows.append({
-                '平台': name,
-                '订单数': sub['order_no'].nunique(),
-                '成本': sub['成本'].sum().round(2),
-                '米数': sub['米数'].sum().round(2),
-                '营业额': sub['merchant_income'].sum().round(2),
-                '快递费': sub['快递费'].sum().round(2),
-                '盈利': sub['盈利'].sum().round(2),
-            })
-    platform_summary = pd.DataFrame(platform_rows)
-    platform_summary.loc[len(platform_summary)] = {
-        '平台': '合计',
-        '订单数': len(normal_df),
-        '成本': normal_df['成本'].sum().round(2) if not normal_df.empty else 0,
-        '米数': normal_df['米数'].sum().round(2) if not normal_df.empty else 0,
-        '营业额': normal_df['merchant_income'].sum().round(2) if not normal_df.empty else 0,
-        '快递费': normal_df['快递费'].sum().round(2) if not normal_df.empty else 0,
-        '盈利': normal_df['盈利'].sum().round(2) if not normal_df.empty else 0,
-    }
+    summary_wide = build_platform_summary(normal_df)
+    platform_summary = build_platform_totals(normal_df)
 
 
 
@@ -698,23 +847,10 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # 保存 Excel
     # ============================================================
     with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
-        summary.to_excel(writer, sheet_name='花型汇总', index=False)
+        write_summary_sheet(writer, summary_wide, sheet_name='花型汇总')
         platform_summary.to_excel(writer, sheet_name='平台汇总', index=False)
         detail.to_excel(writer, sheet_name='订单明细', index=False)
-
-        for sheet_name in writer.sheets:
-            worksheet = writer.sheets[sheet_name]
-            for column in worksheet.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-                adjusted_width = min(max_length + 2, 30)
-                worksheet.column_dimensions[column_letter].width = adjusted_width
+        _auto_width_sheets(writer)
 
     print(f"✅ 日报已生成: {filepath}")
     if not normal_df.empty:
@@ -743,6 +879,127 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     missing_reports = get_missing_report_dates()
     if missing_reports:
         print(f"⚠️ 以下日期有订单但未生成日报：{missing_reports}")
+    return filepath
+
+
+# ============================
+# 区间报告函数
+# ============================
+def generate_range_report(start_date, end_date, force=True, orders=orders):
+    """生成指定日期区间的汇总报表（只输出 Excel，不触碰库存/日报缓存）。
+
+    数据口径与日报一致：只要发货/收货且不退款，都计入营业额与利润；
+    仅排除退款订单与已取消订单，不再额外排除淘宝订单。
+    文件名：区间报告_YYYYMMDD-YYYYMMDD.xlsx
+    """
+    ensure_output_dir()
+
+    try:
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+    except ValueError:
+        print(f"❌ 日期格式错误: {start_date} / {end_date}，请使用 YYYY-MM-DD 格式")
+        return None
+
+    if start_dt > end_dt:
+        print("❌ 开始日期不能晚于结束日期")
+        return None
+
+    start_date = start_dt.strftime('%Y-%m-%d')
+    end_date = end_dt.strftime('%Y-%m-%d')
+    filename = f"区间报告_{start_dt.strftime('%Y%m%d')}-{end_dt.strftime('%Y%m%d')}.xlsx"
+    filepath = os.path.join(OUTPUT_DIR, filename)
+
+    if os.path.exists(filepath) and not force:
+        print(f"⏭️ {filename} 已存在，跳过生成")
+        return filepath
+
+    # ============================================================
+    # 读取区间订单
+    # ============================================================
+    query = text(f"""
+        SELECT
+            id, order_no, product, product_spec,
+            product_quantity, merchant_income,
+            cost, meter, express_cost, traffic_cost, profit,
+            after_sale_status, order_status, platform
+        FROM {orders}
+        WHERE delivery_time >= :start_date
+          AND delivery_time < DATE_ADD(:end_date, INTERVAL 1 DAY)
+          AND delivery_time IS NOT NULL
+    """)
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={"start_date": start_date, "end_date": end_date})
+    except Exception as e:
+        print(f"读取数据库失败: {e}")
+        return None
+
+    if df.empty:
+        print(f"⚠️ {start_date} 到 {end_date} 没有订单数据")
+        return None
+
+    print(f"📋 区间订单数: {len(df)} 条")
+
+    # 加载成本表（按区间结束日口径）
+    cost_map = load_cost_map(end_date)
+    print(f"📚 成本表中有 {len(cost_map)} 个花型（按 {end_date} 口径）")
+
+    # 花型匹配 + 计算（与日报共用）
+    df, matched_count, unmatched_count = _match_flowers_and_calc(df, cost_map)
+    if df is None:
+        print("❌ 区间内没有匹配成功的订单")
+        return None
+
+    # ============================================================
+    # 汇总口径（与日报一致）
+    # ============================================================
+    normal_df = df[(~df['是否退款']) & (df['order_status'] != '已取消')]
+
+    keep_refund_statuses = [
+        '已发货，退款成功',
+        '已收货，退款成功'
+    ]
+    detail_df = df[
+        (df['order_status'] != '已取消') &
+        (
+                (~df['是否退款']) |
+                (df['order_status'].isin(keep_refund_statuses))
+        )
+        ].copy()
+    detail_df.loc[detail_df['是否退款'] == True, ['成本', '米数']] = 0
+
+    # 明细表
+    detail_cols = ['花型', '平台', '成本', '米数', 'merchant_income', '快递费', '盈利',
+                   'after_sale_status', 'order_no', 'product_spec', 'product_quantity', '是否退款']
+    detail = detail_df[detail_cols].copy()
+    detail = detail.rename(columns={
+        'merchant_income': '营业额',
+        'after_sale_status': '售后状态',
+        'product_spec': '商品规格',
+        'product_quantity': '商品数量'
+    })
+    detail = detail.sort_values('花型')
+
+    # 汇总表
+    summary_wide = build_platform_summary(normal_df)
+    platform_summary = build_platform_totals(normal_df)
+
+    if not normal_df.empty:
+        print(f"📊 正常订单 {len(normal_df)} 单 / 营业额 {normal_df['merchant_income'].sum():.2f} / 盈利 {normal_df['盈利'].sum():.2f}")
+    else:
+        print("⚠️ 区间内没有正常订单（可能全部退款/取消）")
+
+    # ============================================================
+    # 保存 Excel
+    # ============================================================
+    with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+        write_summary_sheet(writer, summary_wide, sheet_name='花型汇总')
+        platform_summary.to_excel(writer, sheet_name='平台汇总', index=False)
+        detail.to_excel(writer, sheet_name='订单明细', index=False)
+        _auto_width_sheets(writer)
+
+    print(f"✅ 区间报告已生成: {filepath}")
     return filepath
 
 
@@ -792,6 +1049,8 @@ if __name__ == "__main__":
             while current <= end_dt:
                 generate_daily_report(current.strftime('%Y-%m-%d'), force=True)
                 current += timedelta(days=1)
+        elif sys.argv[1] == "--report" and len(sys.argv) == 4:
+            generate_range_report(sys.argv[2], sys.argv[3], force=True)
         else:
             generate_daily_report(sys.argv[1], force=True)
     else:
