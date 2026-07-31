@@ -1,9 +1,9 @@
-"""Unit tests for :func:`make_daily.extract_flower_from_spec`.
+"""Unit tests for :func:`extract_flower_from_spec` (shared by import_order / make_daily).
 
 This is a pure function (no DB dependency), so it can be tested directly.
 """
 import pandas as pd
-from make_daily import extract_flower_from_spec
+from import_order import extract_flower_from_spec
 
 
 class TestExtractFlowerFromSpec:
@@ -69,3 +69,23 @@ class TestExtractFlowerFromSpec:
     def test_chinese_mixed_punctuation(self):
         """Handle mixed Chinese/English punctuation."""
         assert extract_flower_from_spec("花型A，红色(促销)") == "花型A"
+
+    def test_taobao_sku_prefix(self):
+        """淘宝 SKU 格式：颜色分类:XX一米（门幅...）"""
+        assert extract_flower_from_spec("颜色分类:映日荷花一米（门幅1.43米）") == "映日荷花"
+
+    def test_taobao_sku_length_self(self):
+        """淘宝 SKU 格式：颜色分类:XX两米（长度自选）"""
+        assert extract_flower_from_spec("颜色分类:黑底条纹两米（长度自选）") == "黑底条纹"
+
+    def test_taobao_sku_multi_cut(self):
+        """淘宝 SKU 格式：XX一米价格多拍连裁"""
+        assert extract_flower_from_spec("颜色分类:蓝色唐人一米价格多拍连裁") == "蓝色唐人"
+
+    def test_taobao_sku_no_bracket(self):
+        """淘宝 SKU 无括号：颜色分类:XX三米"""
+        assert extract_flower_from_spec("颜色分类:几何乱纹三米") == "几何乱纹"
+
+    def test_taobao_sku_metric_unit(self):
+        """淘宝 SKU 数字米数：颜色分类:XX 1米"""
+        assert extract_flower_from_spec("颜色分类:腰果花 1米") == "腰果花"
