@@ -1037,27 +1037,41 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
 # ============================
 def generate_all_missing_reports(orders=orders):
     ensure_output_dir()
-    query = text(f"""
-            SELECT DISTINCT DATE(delivery_time) AS order_date
-            FROM {orders}
-            WHERE delivery_time IS NOT NULL
-            ORDER BY order_date
-        """)
-    with engine.connect() as conn:
-        df_dates = pd.read_sql(query, conn)
+    # 1. 获取所有有订单的日期（按 delivery_time）
+    query_order_dates = text(f"""
+        SELECT DISTINCT DATE(delivery_time) AS order_date
+        FROM {orders}
+        WHERE delivery_time IS NOT NULL
+        ORDER BY order_date
+    """)
+    # 2. 获取已有日报缓存的日期
+    query_report_dates = text("""
+        SELECT DISTINCT report_date FROM daily_report_cache
+    """)
 
-    if df_dates.empty:
+    with engine.connect() as conn:
+        df_order_dates = pd.read_sql(query_order_dates, conn)
+        df_report_dates = pd.read_sql(query_report_dates, conn)
+
+    if df_order_dates.empty:
         print("没有订单数据")
         return
 
-    # 🔧 过滤掉 None 值
-    df_dates = df_dates.dropna(subset=['order_date'])
+    order_dates = df_order_dates['order_date'].dropna().tolist()
+    report_dates = df_report_dates['report_date'].dropna().tolist() if not df_report_dates.empty else []
 
-    print(f"找到 {len(df_dates)} 个有订单的日期")
+    # 3. 只生成「有订单但无日报缓存」的日期，已有日报的跳过，避免重复生成
+    missing_dates = sorted(set(order_dates) - set(report_dates))
+
+    if not missing_dates:
+        print("所有有订单的日期均已有日报，无需生成")
+        return
+
+    print(f"找到 {len(missing_dates)} 个缺失日报的日期")
     generated = 0
     failed = []
-    for _, row in df_dates.iterrows():
-        date_ymd = row['order_date'].strftime('%Y-%m-%d')
+    for date in missing_dates:
+        date_ymd = date.strftime('%Y-%m-%d')
         print(f"  📊 生成 {date_ymd} 日报...")
         try:
             generate_daily_report(date_ymd, force=True)

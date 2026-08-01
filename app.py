@@ -147,108 +147,143 @@ elif menu == "📤 导入订单":
         st.write(f"📄 文件名：{uploaded_file.name}")
         st.write(f"📏 文件大小：{uploaded_file.size / 1024:.2f} KB")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🚀 开始导入", type="primary", use_container_width=True):
-                try:
-                    import io
+        # 换了一个新文件时，清空上一次导入结果，避免残留显示
+        new_file_id = uploaded_file.file_id
+        if st.session_state.get("uploaded_file_id") != new_file_id:
+            st.session_state.pop("import_result", None)
+            st.session_state.pop("import_just_done", None)
+            st.session_state.pop("import_regen_msg", None)
+            st.session_state["uploaded_file_id"] = new_file_id
 
-                    file_content = uploaded_file.read()
-                    if uploaded_file.name.endswith('.csv'):
-                        df = pd.read_csv(io.BytesIO(file_content))
+        if st.button("🚀 开始导入", type="primary", use_container_width=True):
+            try:
+                import io
+
+                file_content = uploaded_file.read()
+                if uploaded_file.name.endswith('.csv'):
+                    df = pd.read_csv(io.BytesIO(file_content))
+                else:
+                    df = pd.read_excel(io.BytesIO(file_content), sheet_name=0, engine='openpyxl')
+
+                with st.spinner("正在导入数据..."):
+                    # 调用导入函数（需要从 import_order 导入）
+                    from import_order import import_excel_from_dataframe
+
+                    result = import_excel_from_dataframe(df, uploaded_file.name)
+                    # 结果存入 session_state，跨重跑保留。
+                    # 若不持久化，点击下方「一键重新生成」会触发整体重跑，
+                    # 「开始导入」按钮返回 False，导致结果区不再渲染、回调失效。
+                    st.session_state["import_result"] = result
+                    st.session_state["import_just_done"] = True
+            except Exception as e:
+                st.error(f"❌ 读取文件失败：{e}")
+                st.session_state.pop("import_result", None)
+                import traceback
+
+                st.code(traceback.format_exc())
+
+        # 导入结果展示（放在按钮之外，避免按钮嵌套导致回调失效）
+        import_result = st.session_state.get("import_result")
+        if import_result and import_result["success"]:
+            if st.session_state.pop("import_just_done", False):
+                st.balloons()
+            regen_msg = st.session_state.pop("import_regen_msg", None)
+            if regen_msg:
+                st.success(regen_msg)
+            st.success(f"✅ {import_result['message']}")
+
+            # 📅 检测受影响日期，一键重新生成日报（放在靠上位置，无需下滑即可点击）
+            affected_dates = import_result.get("affected_dates") or []
+            if affected_dates:
+                st.divider()
+                st.info(
+                    f"📅 检测到 {len(affected_dates)} 个日期的订单数据发生变化："
+                    f"{', '.join(affected_dates)}"
+                )
+                if st.button("🚀 一键重新生成这些日期的日报", type="primary"):
+                    from make_daily import generate_daily_report
+
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    total = len(affected_dates)
+                    failed_dates = []
+                    for i, date_str in enumerate(affected_dates):
+                        status_text.text(f"正在生成 {date_str} 日报...")
+                        try:
+                            generate_daily_report(date_str, force=True)
+                        except Exception as e:
+                            failed_dates.append(date_str)
+                            status_text.text(f"⚠️ {date_str} 日报生成失败：{e}")
+                        progress_bar.progress((i + 1) / total)
+                    # 清空受影响日期，防止重复点击重复生成
+                    import_result["affected_dates"] = []
+                    if failed_dates:
+                        st.session_state["import_regen_msg"] = (
+                            f"⚠️ {len(failed_dates)} 个日期日报生成失败：{', '.join(failed_dates)}"
+                        )
                     else:
-                        df = pd.read_excel(io.BytesIO(file_content), sheet_name=0, engine='openpyxl')
+                        st.session_state["import_regen_msg"] = f"✅ {total} 个变化日期的日报已重新生成！"
+                    st.balloons()
+                    st.rerun()
 
-                    # 显示预览
-                    st.subheader("📋 数据预览（前5行）")
-                    st.dataframe(df.head())
+            # 🔧 显示订单变化（重点标注利润影响）
+            changes = import_result.get("changes")
+            if changes and changes.get("changes") is not None and not changes["changes"].empty:
+                st.divider()
+                ch_summary = changes["summary"]
+                st.subheader("🔍 订单变化检测")
 
-                    with st.spinner("正在导入数据..."):
-                        # 调用导入函数（需要从 import_order 导入）
-                        from import_order import import_excel_from_dataframe
+                col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+                with col_c1:
+                    st.metric("🆕 新订单", ch_summary.get("new_orders", 0))
+                with col_c2:
+                    st.metric("📝 变更订单", ch_summary.get("changed_orders", 0))
+                with col_c3:
+                    st.metric("✅ 无变化", ch_summary.get("unchanged_orders", 0))
+                with col_c4:
+                    important = ch_summary.get("important_changes", 0)
+                    st.metric("🔴 重要变化", important,
+                              delta="需关注" if important > 0 else None)
 
-                        result = import_excel_from_dataframe(df, uploaded_file.name)
+                ch_df = changes["changes"]
+                # 样式着色
+                def color_changes(row):
+                    if row['重要程度'] == '🔴 重要':
+                        return ['background-color: #ffe0e0'] * len(row)
+                    elif row['重要程度'] == '🟡 关注':
+                        return ['background-color: #fff3cd'] * len(row)
+                    elif row['变化类型'] == '🆕 新订单':
+                        return ['background-color: #e0f0ff'] * len(row)
+                    return [''] * len(row)
 
-                        if result["success"]:
-                            st.success(f"✅ {result['message']}")
-                            st.balloons()
+                st.dataframe(
+                    ch_df.style.apply(color_changes, axis=1),
+                    use_container_width=True,
+                    height=300
+                )
+                st.caption(
+                    "🔴 红色 = 影响利润的重要变化（状态/金额） | "
+                    "🟡 黄色 = 需关注（数量/规格） | "
+                    "🔵 蓝色 = 新订单"
+                )
+            elif changes and changes.get("changes") is not None and changes["changes"].empty:
+                st.info("📋 所有订单数据与数据库一致，无变化")
 
-                            # 显示导入统计
-                            st.subheader("📊 导入统计")
-                            st.json(result["stats"])
+            # 显示导入统计
+            st.subheader("📊 导入统计")
+            st.json(import_result["stats"])
 
-                            # 🔧 显示订单变化（重点标注利润影响）
-                            changes = result.get("changes")
-                            if changes and changes.get("changes") is not None and not changes["changes"].empty:
-                                st.divider()
-                                ch_summary = changes["summary"]
-                                st.subheader("🔍 订单变化检测")
+            # 同步退款明细
+            st.info("🔄 正在同步退款明细...")
+            try:
+                from populate_refund_details import sync_refund_details
 
-                                col_c1, col_c2, col_c3, col_c4 = st.columns(4)
-                                with col_c1:
-                                    st.metric("🆕 新订单", ch_summary.get("new_orders", 0))
-                                with col_c2:
-                                    st.metric("📝 变更订单", ch_summary.get("changed_orders", 0))
-                                with col_c3:
-                                    st.metric("✅ 无变化", ch_summary.get("unchanged_orders", 0))
-                                with col_c4:
-                                    important = ch_summary.get("important_changes", 0)
-                                    st.metric("🔴 重要变化", important,
-                                              delta="需关注" if important > 0 else None)
-
-
-
-                                ch_df = changes["changes"]
-                                # 样式着色
-                                def color_changes(row):
-                                    if row['重要程度'] == '🔴 重要':
-                                        return ['background-color: #ffe0e0'] * len(row)
-                                    elif row['重要程度'] == '🟡 关注':
-                                        return ['background-color: #fff3cd'] * len(row)
-                                    elif row['变化类型'] == '🆕 新订单':
-                                        return ['background-color: #e0f0ff'] * len(row)
-                                    return [''] * len(row)
-
-                                st.dataframe(
-                                    ch_df.style.apply(color_changes, axis=1),
-                                    use_container_width=True,
-                                    height=300
-                                )
-                                st.caption(
-                                    "🔴 红色 = 影响利润的重要变化（状态/金额） | "
-                                    "🟡 黄色 = 需关注（数量/规格） | "
-                                    "🔵 蓝色 = 新订单"
-                                )
-                            elif changes and changes.get("changes") is not None and changes["changes"].empty:
-                                st.info("📋 所有订单数据与数据库一致，无变化")
-
-                            # 同步退款明细
-                            st.info("🔄 正在同步退款明细...")
-                            try:
-                                from populate_refund_details import sync_refund_details
-
-                                sync_refund_details()
-                                st.success("✅ 退款明细同步完成")
-                            except Exception as e:
-                                st.warning(f"⚠️ 退款明细同步失败（不影响主导入）：{e}")
-                        else:
-                            st.error(f"❌ 导入失败：{result['message']}")
-
-                except Exception as e:
-                    st.error(f"❌ 读取文件失败：{e}")
-                    import traceback
-
-                    st.code(traceback.format_exc())
-
-        with col2:
-            if st.button("🔍 预览数据", use_container_width=True):
-                try:
-                    df = pd.read_excel(uploaded_file, sheet_name=0)
-                    st.subheader("📋 数据预览（前10行）")
-                    st.dataframe(df.head(10))
-                    st.caption(f"共 {len(df)} 行，{len(df.columns)} 列")
-                except Exception as e:
-                    st.error(f"❌ 预览失败：{e}")
+                sync_refund_details()
+                st.success("✅ 退款明细同步完成")
+            except Exception as e:
+                st.warning(f"⚠️ 退款明细同步失败（不影响主导入）：{e}")
+        elif import_result and not import_result["success"]:
+            st.error(f"❌ 导入失败：{import_result['message']}")
 
 # ============================
 # 2. 入库登记
