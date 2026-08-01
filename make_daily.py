@@ -127,13 +127,15 @@ FLOWER_ALIAS_MAP = {
 # ============================
 # 花型匹配与计算（日报/区间报告共用，保证口径一致）
 # ============================
-def _match_flowers_and_calc(df, cost_map):
-    """花型四层匹配 + 米数/成本/快递费/盈利 + 退款标记 + 平台名。
+def assign_flowers(df, cost_flowers):
+    """四层花型匹配：规格提取 → 商品名 contains → 商品+规格拼接 contains → 关键词规则。
 
-    返回 (df, matched_count, unmatched_count)；无匹配订单时 df 为 None。
+    所有行都会得到花型，无法匹配的填 '未匹配'（不过滤）。
+    输入 df 需含 'product' 与 'product_spec' 列。
+    日报/区间报告/退款明细共用，保证花型口径一致。
     """
-    cost_flowers = set(cost_map.keys())
     df = df.copy()
+    cost_flowers = set(cost_flowers)
 
     # 第一步：从规格提取（先做别名归一，再做成本表匹配）
     df['spec_flower'] = df['product_spec'].apply(extract_flower_from_spec)
@@ -143,7 +145,6 @@ def _match_flowers_and_calc(df, cost_map):
     # 第二步：从商品名称匹配
     unmatched_mask = df['花型'].isna()
     if unmatched_mask.any():
-        print(f"🔍 有 {unmatched_mask.sum()} 行未从规格匹配到，尝试从商品名称匹配...")
         for flower in cost_flowers:
             still_unmatched = df['花型'].isna()
             if not still_unmatched.any():
@@ -155,7 +156,6 @@ def _match_flowers_and_calc(df, cost_map):
     # 第三步：商品+规格拼接匹配
     unmatched_mask = df['花型'].isna()
     if unmatched_mask.any():
-        print(f"🔍 仍有 {unmatched_mask.sum()} 行未匹配，尝试用「商品-规格」拼接匹配...")
         df['concat_field'] = df['product'].fillna('') + '-' + df['product_spec'].fillna('')
         for flower in cost_flowers:
             still_unmatched = df['花型'].isna()
@@ -169,7 +169,6 @@ def _match_flowers_and_calc(df, cost_map):
     # 第四步：关键词映射
     unmatched_mask = df['花型'].isna()
     if unmatched_mask.any():
-        print(f"🔍 仍有 {unmatched_mask.sum()} 行未匹配，尝试关键词映射匹配...")
         mapping_rules = [
             {'product_keyword': '唐人', 'spec_color_keyword': '紫色', 'target_flower': '唐人紫色'},
             {'product_keyword': '唐人', 'spec_color_keyword': '蓝色', 'target_flower': '唐人蓝色'},
@@ -213,6 +212,16 @@ def _match_flowers_and_calc(df, cost_map):
                 matched = True
 
     df['花型'] = df['花型'].fillna('未匹配')
+    return df
+
+
+def _match_flowers_and_calc(df, cost_map):
+    """花型四层匹配 + 米数/成本/快递费/盈利 + 退款标记 + 平台名。
+
+    返回 (df, matched_count, unmatched_count)；无匹配订单时 df 为 None。
+    """
+    cost_flowers = set(cost_map.keys())
+    df = assign_flowers(df, cost_flowers)
 
     # 打印未匹配订单
     final_unmatched = df[df['花型'] == '未匹配']
