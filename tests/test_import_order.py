@@ -191,6 +191,43 @@ class TestImportExcelFromDataFrame:
         result = import_excel_from_dataframe(df, 'test.xlsx')
         assert result['success'] is True
         assert result['stats']['成功导入'] == 2
+        assert result['affected_dates'] == []
+
+    @patch('import_order.engine')
+    def test_affected_dates_from_changed_orders(self, mock_engine, mock_conn):
+        """成功导入后应返回变化订单的发货日期（去重、排序、格式化为 %Y-%m-%d）。"""
+        from datetime import date
+
+        df = pd.DataFrame({
+            '订单号': ['ORD001', 'ORD002'],
+            '商品': ['花型A布料', '花型B布料'],
+            '商家实收金额(元)': [50.0, 80.0],
+            '商品规格': ['规格A', '规格B'],
+            '发货时间': ['2026-07-01 10:00:00', '2026-07-02 12:00:00'],
+        })
+
+        begin_conn = MagicMock(name='begin_conn')
+        begin_conn.execute.return_value.rowcount = 1
+        mock_engine.begin.return_value.__enter__.return_value = begin_conn
+
+        connect_conn = MagicMock(name='connect_conn')
+
+        def connect_execute(sql, params=None, **kw):
+            s = str(sql)
+            result = MagicMock()
+            # 受影响日期查询（变化订单的发货日期）；其余查询（旧数据对比等）返回空
+            if 'delivery_time' in s and 'order_no IN' in s:
+                result.fetchall.return_value = [(date(2026, 7, 1),), (date(2026, 7, 2),)]
+            else:
+                result.fetchall.return_value = []
+            return result
+
+        connect_conn.execute.side_effect = connect_execute
+        mock_engine.connect.return_value.__enter__.return_value = connect_conn
+
+        result = import_excel_from_dataframe(df, 'test.xlsx')
+        assert result['success'] is True
+        assert result['affected_dates'] == ['2026-07-01', '2026-07-02']
 
 
 # ===========================================================================

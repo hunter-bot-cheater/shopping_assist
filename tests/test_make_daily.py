@@ -376,21 +376,50 @@ class TestGenerateAllMissingReports:
     @patch('make_daily.generate_daily_report')
     @patch('make_daily.ensure_output_dir')
     def test_generates_for_each_date(self, mock_ensure, mock_gen, mock_read_sql, mock_conn):
-        """Should call generate_daily_report for each order date."""
-        mock_read_sql.return_value = pd.DataFrame({
-            'order_date': pd.to_datetime(['2026-07-01', '2026-07-02']),
-        })
+        """有订单但无日报的日期应逐个生成日报。"""
+        mock_read_sql.side_effect = [
+            pd.DataFrame({'order_date': pd.to_datetime(['2026-07-01', '2026-07-02'])}),
+            pd.DataFrame(columns=['report_date']),  # 无任何日报缓存
+        ]
         generate_all_missing_reports()
         assert mock_gen.call_count == 2
+        mock_gen.assert_any_call('2026-07-01', force=True)
+        mock_gen.assert_any_call('2026-07-02', force=True)
+
+    @patch('pandas.read_sql')
+    @patch('make_daily.generate_daily_report')
+    @patch('make_daily.ensure_output_dir')
+    def test_skips_already_generated_dates(self, mock_ensure, mock_gen, mock_read_sql, mock_conn):
+        """已有日报缓存的日期应跳过，只生成缺失的日期。"""
+        mock_read_sql.side_effect = [
+            pd.DataFrame({'order_date': pd.to_datetime(['2026-07-01', '2026-07-02'])}),
+            pd.DataFrame({'report_date': pd.to_datetime(['2026-07-01'])}),  # 07-01 已有日报
+        ]
+        generate_all_missing_reports()
+        assert mock_gen.call_count == 1
+        mock_gen.assert_called_once_with('2026-07-02', force=True)
+
+    @patch('pandas.read_sql')
+    @patch('make_daily.generate_daily_report')
+    @patch('make_daily.ensure_output_dir')
+    def test_all_dates_have_reports(self, mock_ensure, mock_gen, mock_read_sql, mock_conn):
+        """所有有订单的日期均已有日报时，不做任何生成。"""
+        mock_read_sql.side_effect = [
+            pd.DataFrame({'order_date': pd.to_datetime(['2026-07-01'])}),
+            pd.DataFrame({'report_date': pd.to_datetime(['2026-07-01'])}),
+        ]
+        generate_all_missing_reports()
+        mock_gen.assert_not_called()
 
     @patch('pandas.read_sql')
     @patch('make_daily.generate_daily_report')
     @patch('make_daily.ensure_output_dir')
     def test_skips_locked_file_and_continues(self, mock_ensure, mock_gen, mock_read_sql, mock_conn):
         """某日期的日报文件被 Excel 占用时，应跳过该日期并继续生成其余日期，不中断整个批次。"""
-        mock_read_sql.return_value = pd.DataFrame({
-            'order_date': pd.to_datetime(['2026-07-01', '2026-07-02']),
-        })
+        mock_read_sql.side_effect = [
+            pd.DataFrame({'order_date': pd.to_datetime(['2026-07-01', '2026-07-02'])}),
+            pd.DataFrame(columns=['report_date']),  # 无日报缓存，两日均需生成
+        ]
         # 第一个日期文件被占用抛 PermissionError，第二个日期正常生成
         mock_gen.side_effect = [PermissionError("file locked"), None]
         generate_all_missing_reports()  # 不应抛出异常

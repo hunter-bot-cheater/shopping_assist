@@ -843,11 +843,34 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
 
         stats["成功导入"] = total
 
+        # ============================================================
+        # 第十步：收集受影响日期（有变化订单的发货日期，日报按发货时间统计）
+        # ============================================================
+        affected_dates = set()
+        changes_df = changes.get("changes")
+        if changes_df is not None and not changes_df.empty and '订单号' in changes_df.columns:
+            order_nos = changes_df['订单号'].dropna().unique().tolist()
+            if order_nos:
+                with engine.connect() as conn:
+                    placeholders = ', '.join([f':o{i}' for i in range(len(order_nos))])
+                    params = {f'o{i}': on for i, on in enumerate(order_nos)}
+                    query = sqlalchemy.text(f"""
+                        SELECT DISTINCT DATE(delivery_time) AS affected_date
+                        FROM {orders}
+                        WHERE order_no IN ({placeholders})
+                          AND delivery_time IS NOT NULL
+                    """)
+                    rows = conn.execute(query, params).fetchall()
+                    for row in rows:
+                        d = row[0]
+                        affected_dates.add(d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d))
+
         return {
             "success": True,
             "message": f"成功导入 {total} 条数据到 {orders} 表",
             "stats": stats,
             "changes": changes,
+            "affected_dates": sorted(affected_dates),
         }
 
     except Exception as e:
@@ -856,6 +879,7 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
             "message": str(e),
             "stats": {},
             "changes": None,
+            "affected_dates": [],
         }
 if __name__ == "__main__":
     # 自动查找最新文件
