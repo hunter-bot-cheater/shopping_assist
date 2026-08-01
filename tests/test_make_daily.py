@@ -177,37 +177,42 @@ class TestPlatformGrouping:
             with pd.ExcelFile(xlsx_files[0]) as xf:
                 assert set(xf.sheet_names) == {'花型汇总', '平台汇总', '订单明细'}
 
-                # 花型汇总：左右分列（花型 | 拼多多6列 | 空2 | 淘宝6列 | 空2 | 汇总6列 = 23 列）
+                # 花型汇总：左右分列（花型 | 拼多多6列 | 空2 | 淘宝6列 | 空2 | 抖音6列 | 空2 | 汇总6列 = 31 列）
                 head = pd.read_excel(xf, '花型汇总', header=None, nrows=2)
-                assert head.shape[1] == 23
+                assert head.shape[1] == 31
                 # 第1行：平台合并表头
                 assert head.iloc[0, 0] == '花型'
                 assert head.iloc[0, 1] == '拼多多'
                 assert head.iloc[0, 9] == '淘宝'
-                assert head.iloc[0, 17] == '汇总'
+                assert head.iloc[0, 17] == '抖音'
+                assert head.iloc[0, 25] == '汇总'
                 # 第2行：指标名
                 assert head.iloc[1, 1] == '订单数'
                 assert head.iloc[1, 4] == '营业额'
                 assert head.iloc[1, 9] == '订单数'
                 assert head.iloc[1, 17] == '订单数'
+                assert head.iloc[1, 25] == '订单数'
 
                 # 数据行：花型按汇总营业额降序，末尾总计行
                 data = pd.read_excel(xf, '花型汇总', header=None, skiprows=2)
-                assert data.shape[1] == 23
+                assert data.shape[1] == 31
                 flowers = data[0].tolist()
                 assert '花型A' in flowers
                 assert '花型B' in flowers
                 assert flowers[-1] == '【总计】'
 
-                # 拼多多块（花型A）/ 淘宝块（花型B）数据落位正确
+                # 拼多多块（花型A）/ 淘宝块（花型B）数据落位正确，抖音块全为0
                 row_a = data[data[0] == '花型A'].iloc[0]
                 row_b = data[data[0] == '花型B'].iloc[0]
                 assert row_a[1] == 1        # 拼多多_订单数
                 assert row_a[4] == 50.0     # 拼多多_营业额
                 assert row_b[9] == 1        # 淘宝_订单数
                 assert row_b[12] == 90.0    # 淘宝_营业额
-                assert row_a[17] == 1       # 汇总_订单数
-                assert data[data[0] == '【总计】'].iloc[0][17] == 2  # 汇总订单总数
+                assert row_a[17] == 0       # 抖音_订单数（无数据）
+                assert row_a[20] == 0       # 抖音_营业额
+                assert row_a[25] == 1       # 汇总_订单数
+                assert data[data[0] == '【总计】'].iloc[0][25] == 2  # 汇总订单总数
+                assert data[data[0] == '【总计】'].iloc[0][17] == 0  # 抖音订单总数
 
                 # 平台汇总：拼多多/淘宝/抖音 三行齐全（无数据补 0）+ 合计
                 ps = pd.read_excel(xf, '平台汇总')
@@ -240,27 +245,31 @@ class TestBuildPlatformSummary:
             '盈利': [27.5, -5.5],
         })
         wide = build_platform_summary(normal_df)
-        # 花型 | 拼多多6列 | 空2 | 淘宝6列 | 空2 | 汇总6列 = 23 列
-        assert len(wide.columns) == 23
+        # 花型 | 拼多多6列 | 空2 | 淘宝6列 | 空2 | 抖音6列 | 空2 | 汇总6列 = 31 列
+        assert len(wide.columns) == 31
         assert wide.columns[0] == '花型'
         assert '拼多多_营业额' in wide.columns
         assert '淘宝_营业额' in wide.columns
+        assert '抖音_营业额' in wide.columns
         assert '汇总_营业额' in wide.columns
         assert wide['花型'].tolist()[-1] == '【总计】'
 
         row = wide[wide['花型'] == '花型A'].iloc[0]
         assert row['拼多多_营业额'] == 50.0
         assert row['淘宝_营业额'] == 0
+        assert row['抖音_营业额'] == 0
         assert row['汇总_营业额'] == 50.0
 
         tot = wide[wide['花型'] == '【总计】'].iloc[0]
         assert tot['拼多多_营业额'] == 50.0
         assert tot['淘宝_营业额'] == 90.0
+        assert tot['抖音_营业额'] == 0
         assert tot['汇总_营业额'] == 140.0
         # 空列占位（每平台块独立）
         assert wide['_spacer_0_1'].iloc[0] == ''
         assert wide['_spacer_0_2'].iloc[0] == ''
         assert wide['_spacer_1_1'].iloc[0] == ''
+        assert wide['_spacer_2_1'].iloc[0] == ''
 
 
 # ===========================================================================
@@ -303,9 +312,10 @@ class TestGenerateRangeReport:
             with pd.ExcelFile(result) as xf:
                 assert set(xf.sheet_names) == {'花型汇总', '平台汇总', '订单明细'}
                 head = pd.read_excel(xf, '花型汇总', header=None, nrows=2)
-                assert head.shape[1] == 23
+                assert head.shape[1] == 31
                 assert head.iloc[0, 9] == '淘宝'
-                assert head.iloc[0, 17] == '汇总'
+                assert head.iloc[0, 17] == '抖音'
+                assert head.iloc[0, 25] == '汇总'
 
     def test_range_report_counts_shipped_taobao(self, tmp_path):
         """发货且不退款的淘宝订单计入，不因 merchant_income=0 被排除。"""
@@ -371,6 +381,19 @@ class TestGenerateAllMissingReports:
             'order_date': pd.to_datetime(['2026-07-01', '2026-07-02']),
         })
         generate_all_missing_reports()
+        assert mock_gen.call_count == 2
+
+    @patch('pandas.read_sql')
+    @patch('make_daily.generate_daily_report')
+    @patch('make_daily.ensure_output_dir')
+    def test_skips_locked_file_and_continues(self, mock_ensure, mock_gen, mock_read_sql, mock_conn):
+        """某日期的日报文件被 Excel 占用时，应跳过该日期并继续生成其余日期，不中断整个批次。"""
+        mock_read_sql.return_value = pd.DataFrame({
+            'order_date': pd.to_datetime(['2026-07-01', '2026-07-02']),
+        })
+        # 第一个日期文件被占用抛 PermissionError，第二个日期正常生成
+        mock_gen.side_effect = [PermissionError("file locked"), None]
+        generate_all_missing_reports()  # 不应抛出异常
         assert mock_gen.call_count == 2
 
 

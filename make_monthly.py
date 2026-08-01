@@ -11,7 +11,7 @@ from sqlalchemy import text
 from mysql_conn import engine
 
 from import_order import orders, PLATFORM_NAMES
-from make_daily import build_platform_summary, build_platform_totals, write_summary_sheet, _auto_width_sheets
+from make_daily import build_platform_summary, build_platform_totals, write_summary_sheet, _auto_width_sheets, CANCELLED_STATUSES, FLOWER_ALIAS_MAP
 # ==========================================================
 # 配置
 # ==========================================================
@@ -68,27 +68,27 @@ def extract_flower_from_spec(spec):
 
 
 
-    # 中文/英文逗号
+    # 逗号/分号分隔，取第一段（分号用于抖音规格「花型;二米」，拼多多/淘宝无分号）
 
-    for sep in [',','，']:
+    for sep in [',','，',';','；']:
 
         if sep in spec:
 
-            flower = spec.split(sep)[0].strip()
+            spec = spec.split(sep)[0].strip()
 
-            return flower if flower else None
+            break
 
 
 
-    # 中英文括号
+    # 中英文括号（门幅/克重等说明）
 
     for sep in ['（','(']:
 
         if sep in spec:
 
-            flower = spec.split(sep)[0].strip()
+            spec = spec.split(sep)[0].strip()
 
-            return flower if flower else None
+            break
 
 
 
@@ -553,17 +553,13 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
         extract_flower_from_spec
     )
 
+    # 花型标准化映射：先做别名归一，再做成本表匹配（与日报口径一致）
+    df['spec_flower'] = df['spec_flower'].replace(FLOWER_ALIAS_MAP)
 
     df['花型'] = df['spec_flower'].apply(
         lambda x:
         x if x in cost_flowers else None
     )
-
-    # ─── 花型标准化映射（合并同名花型） ───
-    flower_alias_map = {
-        '白底黑色条纹': '白底乱纹',
-    }
-    df['花型'] = df['花型'].replace(flower_alias_map)
 
     # ----------------------------------------------------------
     # 第二层：
@@ -1163,7 +1159,11 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
 
     normal_df=df[
 
-        ~df['是否退款']
+        (~df['是否退款'])
+
+        &
+
+        (~df['order_status'].isin(CANCELLED_STATUSES))
 
     ]
 

@@ -53,9 +53,11 @@ COLUMN_MAPPING = {
 PLATFORM_PDD, PLATFORM_TAOBAO, PLATFORM_DOUYIN = 0, 1, 2
 PLATFORM_NAMES = {PLATFORM_PDD: "拼多多", PLATFORM_TAOBAO: "淘宝", PLATFORM_DOUYIN: "抖音"}
 
-# 平台特征列（用于自动识别平台；dict 插入顺序=识别优先级，淘宝在前）
+# 平台特征列（用于自动识别平台；dict 插入顺序=识别优先级）
+# 注意：抖音文件含"售后状态"列（拼多多特征之一），抖音必须排在拼多多之前
 PLATFORM_FEATURE_COLUMNS = {
     PLATFORM_TAOBAO: ['订单编号', '商品标题', '宝贝种类', '商品名称'],
+    PLATFORM_DOUYIN: ['主订单编号', '子订单编号', '选购商品'],
     PLATFORM_PDD: ['订单号', '商品', '商家实收金额(元)', '售后状态'],
 }
 
@@ -69,6 +71,17 @@ PLATFORM_COLUMN_MAPPINGS = {
         '商品属性SKU': '商品规格', '物流单号': '快递单号', '物流公司': '快递公司',
         '订单创建时间': '订单成交时间', '订单状态': '订单状态', '商家备注': '商家备注',
         '退款金额': '_temp_refund_amount', '订单关闭原因': '_temp_close_reason',
+    },
+    PLATFORM_DOUYIN: {
+        # 用子订单编号作订单号：抖音一个主订单含多个子订单行，主订单编号会使
+        # 同父订单多行 UPSERT 互相覆盖导致丢数据；子订单编号全文件唯一(206/206)
+        '子订单编号': '订单号',
+        '选购商品': '商品', '商品数量': '商品数量(件)',
+        '订单应付金额': '商家实收金额(元)', '运费': '邮费(元)',
+        '订单状态': '订单状态', '售后状态': '售后状态',
+        '发货时间': '发货时间', '订单完成时间': '确认收货时间',
+        '订单提交时间': '订单成交时间', '物流SN码': '快递单号',
+        '商家备注': '商家备注', '取消原因': '_temp_close_reason',
     },
 }
 
@@ -141,8 +154,8 @@ def extract_flower_from_spec(spec):
     # 淘宝 SKU 前缀：颜色分类:XX一米（门幅1.43米）
     if '颜色分类' in spec:
         spec = re.sub(r'^.*?颜色分类[:：]?', '', spec).strip()
-    # 多个 SKU 用逗号分隔时取第一个
-    for sep in [',', '，']:
+    # 多个 SKU 用逗号/分号分隔时取第一个（抖音规格形如「花型;二米（说明）」）
+    for sep in [',', '，', ';', '；']:
         if sep in spec:
             spec = spec.split(sep)[0].strip()
             break
@@ -203,6 +216,37 @@ def gen_taobao_after_sale_status(row):
             return '已收货，退款成功'
 
     return None
+
+def gen_douyin_after_sale_status(row):
+    """合成抖音标准售后状态。
+
+    抖音原生售后状态有「退款成功/售后关闭/售后待处理/补寄*」等值。
+    仅当 售后状态 含"退款成功"（或取消原因含"退款"）时视为退款，
+    按发货/收货时间区分 '未发货/已发货/已收货，退款成功'；其余返回 None。
+    """
+    after_sale = str(row.get('售后状态', '')).strip()
+    close_reason = str(row.get('_temp_close_reason', ''))
+    delivery_time = row.get('发货时间')
+    receive_time = row.get('确认收货时间')
+
+    if '退款成功' not in after_sale and '退款' not in close_reason:
+        return None
+
+    def _is_empty(v):
+        if v is None:
+            return True
+        if isinstance(v, str):
+            return not v.strip() or v.strip().lower() in ('nan', 'none', 'nat')
+        try:
+            return bool(pd.isna(v))
+        except (TypeError, ValueError):
+            return False
+
+    if _is_empty(delivery_time):
+        return '未发货，退款成功'
+    if _is_empty(receive_time):
+        return '已发货，退款成功'
+    return '已收货，退款成功'
 
 def platform_column_exists():
     """检查 data2026 表是否已有 platform 列。"""
@@ -280,6 +324,9 @@ def import_excel(file_path=None):
                 empty_prod = df['商品'].isna() & df['商品规格'].notna()
                 if empty_prod.any():
                     df.loc[empty_prod, '商品'] = df.loc[empty_prod, '商品规格'].apply(extract_flower_from_spec)
+        elif platform == PLATFORM_DOUYIN:
+            df['售后状态'] = df.apply(gen_douyin_after_sale_status, axis=1)
+            df = df.drop(columns=['_temp_close_reason'], errors='ignore')
 
     # 4. 检查必要列是否存在（映射后统一为拼多多标准列名）
     required_cols = ["订单号", "商品", "商家实收金额(元)"]
@@ -668,6 +715,11 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
                 if empty_prod.any():
                     df.loc[empty_prod, '商品'] = df.loc[empty_prod, '商品规格'].apply(extract_flower_from_spec)
             print(f"✅ 淘宝格式映射完成，共 {len(df)} 行")
+        elif platform == PLATFORM_DOUYIN:
+            # 抖音原生售后状态是「退款成功/售后关闭/补寄*」等，需合成标准状态
+            df['售后状态'] = df.apply(gen_douyin_after_sale_status, axis=1)
+            df = df.drop(columns=['_temp_close_reason'], errors='ignore')
+            print(f"✅ 抖音格式映射完成，共 {len(df)} 行")
         else:
             print("🔍 拼多多格式直接处理")
 

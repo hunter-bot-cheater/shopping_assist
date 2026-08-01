@@ -16,10 +16,12 @@ POSTAGE_PER_ORDER = 2.5
 
 # 汇总表指标列（顺序固定：订单数、成本、米数、营业额、快递费、盈利）
 SUMMARY_METRICS = ['订单数', '成本', '米数', '营业额', '快递费', '盈利']
-# 花型汇总左右分列展示的平台（新增平台在此追加，如 '抖音'）
-SUMMARY_PLATFORMS = ('拼多多', '淘宝')
+# 花型汇总左右分列展示的平台（新增平台在此追加）
+SUMMARY_PLATFORMS = ('拼多多', '淘宝', '抖音')
 # 平台汇总表始终展示的平台（无数据补 0）
 PLATFORM_SUMMARY_NAMES = ('拼多多', '淘宝', '抖音')
+# 已取消/已关闭的订单状态（拼多多=已取消，抖音=已关闭；淘宝=交易关闭单独处理）
+CANCELLED_STATUSES = ('已取消', '已关闭')
 
 
 # ============================
@@ -61,6 +63,17 @@ def extract_meter_from_spec(spec):
     match = re.search(r'(\d+\.?\d*)\s*(米|m)', first_part, re.I)
     if match:
         return float(match.group(1))
+
+    # 抖音规格兜底：米数常在分号后（如「花型;二米（说明）」），
+    # 且可能被前面的（门幅）括号截断；分号不出现在拼多多/淘宝规格中，不影响既有结果
+    for seg in re.split(r'[;；]', spec):
+        seg2 = re.split(r'[（(]', seg)[0].strip()
+        for k, v in chinese_map.items():
+            if k in seg2:
+                return v
+        match = re.search(r'(\d+\.?\d*)\s*(米|m)', seg2, re.I)
+        if match:
+            return float(match.group(1))
     return 0
 
 
@@ -84,6 +97,33 @@ def load_cost_map(report_date=None):
     except Exception as e:
         print(f"加载成本表失败: {e}")
         return {}
+# 花型标准名映射：将同花型的不同叫法统一到成本表名称
+# （含淘宝商品名与成本表差异、抖音规格别名），日报/月报共用
+FLOWER_ALIAS_MAP = {
+    '白底乱纹': '白底乱纹',
+    '白底黑色条纹': '白底乱纹',
+    "几何乱纹": "白底乱纹",
+    # 淘宝商品名 → 成本表花型
+    '蓝色唐人': '唐人蓝色',
+    '紫色唐人': '唐人紫色',
+    '皮粉唐人': '唐人粉色',
+    '粉色唐人': '唐人粉色',
+    '黄色唐人': '黄色小唐人',
+    '水墨风蝴蝶': '水墨蝴蝶',
+    '雅韵青花': '青花雅韵',
+    '三色拼读': '三色拼写',
+    "黑底条纹": "城市条纹",
+    "黑白玄纹": "玄纹密码",
+    "条纹哪吒": "黄底哪吒",
+    "腰果花": "灰白底腰果花",
+    # 抖音规格别名 → 成本表花型
+    '绿野浮蝶': '绿影浮蝶',
+    '紫底小唐人': '唐人紫色',
+    '白底条纹': '白底乱纹',
+    '蓝底小唐人': '唐人蓝色',
+    '粉底小唐人': '唐人粉色',
+}
+
 # ============================
 # 花型匹配与计算（日报/区间报告共用，保证口径一致）
 # ============================
@@ -95,29 +135,9 @@ def _match_flowers_and_calc(df, cost_map):
     cost_flowers = set(cost_map.keys())
     df = df.copy()
 
-    # ─── 花型标准化映射 ───
-    # 将同花型的不同叫法统一到成本表名称（含淘宝商品名与成本表差异）
-    flower_alias_map = {
-        '白底乱纹': '白底乱纹',
-        '白底黑色条纹': '白底乱纹',
-        "几何乱纹":"白底乱纹",
-        # 淘宝商品名 → 成本表花型
-        '蓝色唐人': '唐人蓝色',
-        '紫色唐人': '唐人紫色',
-        '皮粉唐人': '唐人粉色',
-        '粉色唐人': '唐人粉色',
-        '黄色唐人': '黄色小唐人',
-        '水墨风蝴蝶': '水墨蝴蝶',
-        '雅韵青花': '青花雅韵',
-        '三色拼读': '三色拼写',
-        "黑底条纹":"城市条纹",
-        "黑白玄纹":"玄纹密码",
-        "条纹哪吒":"黄底哪吒",
-        "腰果花":"灰白底腰果花"
-    }
     # 第一步：从规格提取（先做别名归一，再做成本表匹配）
     df['spec_flower'] = df['product_spec'].apply(extract_flower_from_spec)
-    df['spec_flower'] = df['spec_flower'].replace(flower_alias_map)
+    df['spec_flower'] = df['spec_flower'].replace(FLOWER_ALIAS_MAP)
     df['花型'] = df['spec_flower'].apply(lambda x: x if x in cost_flowers else None)
 
     # 第二步：从商品名称匹配
@@ -592,7 +612,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # ============================================================
     # 正常订单（汇总表用：排除所有退款和取消）
     # ============================================================
-    normal_df = df[(~df['是否退款']) & (df['order_status'] != '已取消')]
+    normal_df = df[(~df['是否退款']) & (~df['order_status'].isin(CANCELLED_STATUSES))]
 
     # ============================================================
     # 明细表数据：正常订单 + 已发货/已收货退款订单（用于对账/运费核算）
@@ -605,7 +625,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
 
     # 明细表数据：正常订单 + 符合条件的退款订单
     detail_df = df[
-        (df['order_status'] != '已取消') &
+        (~df['order_status'].isin(CANCELLED_STATUSES)) &
         (
                 (~df['是否退款']) |
                 (df['order_status'].isin(keep_refund_statuses))
@@ -889,7 +909,7 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
     """生成指定日期区间的汇总报表（只输出 Excel，不触碰库存/日报缓存）。
 
     数据口径与日报一致：只要发货/收货且不退款，都计入营业额与利润；
-    仅排除退款订单与已取消订单，不再额外排除淘宝订单。
+    仅排除退款订单与已取消/已关闭订单。
     文件名：区间报告_YYYYMMDD-YYYYMMDD.xlsx
     """
     ensure_output_dir()
@@ -954,14 +974,14 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
     # ============================================================
     # 汇总口径（与日报一致）
     # ============================================================
-    normal_df = df[(~df['是否退款']) & (df['order_status'] != '已取消')]
+    normal_df = df[(~df['是否退款']) & (~df['order_status'].isin(CANCELLED_STATUSES))]
 
     keep_refund_statuses = [
         '已发货，退款成功',
         '已收货，退款成功'
     ]
     detail_df = df[
-        (df['order_status'] != '已取消') &
+        (~df['order_status'].isin(CANCELLED_STATUSES)) &
         (
                 (~df['是否退款']) |
                 (df['order_status'].isin(keep_refund_statuses))
@@ -1026,12 +1046,21 @@ def generate_all_missing_reports(orders=orders):
 
     print(f"找到 {len(df_dates)} 个有订单的日期")
     generated = 0
+    failed = []
     for _, row in df_dates.iterrows():
         date_ymd = row['order_date'].strftime('%Y-%m-%d')
         print(f"  📊 生成 {date_ymd} 日报...")
-        generate_daily_report(date_ymd, force=True)
-        generated += 1
-    print(f"\n✅ 完成: 生成 {generated} 个")
+        try:
+            generate_daily_report(date_ymd, force=True)
+            generated += 1
+        except OSError as e:
+            # Windows 下目标日报文件可能正被 Excel 打开占用，跳过该日期继续生成其余日期
+            failed.append(date_ymd)
+            print(f"  ⚠️ {date_ymd} 日报写入失败（文件被占用/锁定）: {e}")
+            print(f"     请关闭 {OUTPUT_DIR}\\{date_ymd.replace('-', '')}日报.xlsx 后重试该日期")
+    print(f"\n✅ 完成: 成功生成 {generated} 个")
+    if failed:
+        print(f"⚠️ 以下日期写入失败（通常因文件正被 Excel 打开）: {', '.join(failed)}")
 
 # ============================
 # 入口
