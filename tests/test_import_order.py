@@ -15,8 +15,11 @@ from import_order import (
     import_excel_from_dataframe,
     detect_platform,
     gen_taobao_after_sale_status,
+    gen_douyin_after_sale_status,
+    extract_flower_from_spec,
     PLATFORM_PDD,
     PLATFORM_TAOBAO,
+    PLATFORM_DOUYIN,
 )
 
 
@@ -302,3 +305,106 @@ class TestTaobaoImport:
         result = import_excel_from_dataframe(df, 'taobao.xlsx')
         assert result['success'] is False
         assert '缺少必要列' in result['message']
+
+
+# ===========================================================================
+# 抖音导入（平台自动识别 + 售后状态合成 + 花型提取）
+# ===========================================================================
+
+class TestDouyinImport:
+
+    def test_detect_platform_douyin(self):
+        """含主订单编号/选购商品的 DataFrame 识别为抖音。"""
+        df = pd.DataFrame({
+            '主订单编号': ['DY001'], '选购商品': ['布料'], '商品规格': ['花型A;二米'],
+        })
+        assert detect_platform(df) == PLATFORM_DOUYIN
+
+    def test_detect_platform_douyin_before_pdd(self):
+        """抖音文件含"售后状态"列（拼多多特征），但应识别为抖音而非拼多多。"""
+        df = pd.DataFrame({
+            '主订单编号': ['DY001'], '选购商品': ['布料'], '售后状态': ['退款成功'],
+        })
+        assert detect_platform(df) == PLATFORM_DOUYIN
+
+    def test_after_sale_status_completed_no_refund(self):
+        """已完成且无退款 → None。"""
+        row = {'订单状态': '已完成', '售后状态': '-', '_temp_close_reason': '',
+               '发货时间': pd.Timestamp('2026-07-15'), '确认收货时间': pd.Timestamp('2026-07-16')}
+        assert gen_douyin_after_sale_status(row) is None
+
+    def test_after_sale_status_refund_not_delivered(self):
+        """退款成功 + 未发货 → 未发货，退款成功。"""
+        row = {'订单状态': '已关闭', '售后状态': '退款成功', '_temp_close_reason': '',
+               '发货时间': pd.NaT, '确认收货时间': pd.NaT}
+        assert gen_douyin_after_sale_status(row) == '未发货，退款成功'
+
+    def test_after_sale_status_refund_delivered(self):
+        """退款成功 + 已发货未收货 → 已发货，退款成功。"""
+        row = {'订单状态': '已关闭', '售后状态': '退款成功', '_temp_close_reason': '',
+               '发货时间': pd.Timestamp('2026-07-15'), '确认收货时间': pd.NaT}
+        assert gen_douyin_after_sale_status(row) == '已发货，退款成功'
+
+    def test_after_sale_status_refund_received(self):
+        """退款成功 + 已收货 → 已收货，退款成功。"""
+        row = {'订单状态': '已关闭', '售后状态': '退款成功', '_temp_close_reason': '',
+               '发货时间': pd.Timestamp('2026-07-15'), '确认收货时间': pd.Timestamp('2026-07-16')}
+        assert gen_douyin_after_sale_status(row) == '已收货，退款成功'
+
+    def test_after_sale_status_close_reason_refund(self):
+        """售后状态非退款，但取消原因含退款 → 按发货时间判断。"""
+        row = {'订单状态': '已关闭', '售后状态': '-', '_temp_close_reason': '买家申请退款',
+               '发货时间': pd.Timestamp('2026-07-15'), '确认收货时间': pd.NaT}
+        assert gen_douyin_after_sale_status(row) == '已发货，退款成功'
+
+    def test_after_sale_status_after_sale_closed_not_refund(self):
+        """售后状态=售后关闭（非退款成功）→ None。"""
+        row = {'订单状态': '已完成', '售后状态': '售后关闭', '_temp_close_reason': '',
+               '发货时间': pd.Timestamp('2026-07-15'), '确认收货时间': pd.Timestamp('2026-07-16')}
+        assert gen_douyin_after_sale_status(row) is None
+
+    def test_extract_flower_semicolon(self):
+        """抖音规格用分号分隔花型与米数。"""
+        assert extract_flower_from_spec('3D立体太阳花;二米（绵绸人棉100%）多拍连裁') == '3D立体太阳花'
+
+    def test_extract_flower_semicolon_with_paren(self):
+        """抖音规格门幅括号在分号前，也应正确提取花型。"""
+        assert extract_flower_from_spec('腰果花（门副1.40到1.45）60支;二米（绵绸人棉100%）多拍连裁') == '腰果花'
+
+    @patch('import_order.engine')
+    def test_douyin_import_success(self, mock_engine, mock_conn):
+        """抖音列格式应自动识别并成功导入，INSERT 需带 platform=2。"""
+        df = pd.DataFrame({
+            '主订单编号': ['DY0001', 'DY0001', 'DY0002'],
+            '子订单编号': ['DY001', 'DY002', 'DY003'],
+            '选购商品': ['花型A布料', '花型B布料', '花型C布料'],
+            '商品规格': ['花型A;二米', '花型B;三米', '花型C;二米'],
+            '商品数量': [1, 2, 1],
+            '订单应付金额': [17.58, 26.38, 9.0],
+            '订单状态': ['已发货', '已完成', '已发货'],
+            '售后状态': ['-', '-', '-'],
+            '发货时间': ['2026-07-15 10:00:00', '2026-07-15 11:00:00', '2026-07-15 12:00:00'],
+            '订单完成时间': [None, '2026-07-16 11:00:00', None],
+            '订单提交时间': ['2026-07-15 09:00:00', '2026-07-15 10:00:00', '2026-07-15 11:00:00'],
+            '物流SN码': ['SN001', 'SN002', 'SN003'],
+            '取消原因': [None, None, None],
+        })
+        mock_engine.begin.return_value.__enter__.return_value = mock_conn
+
+        result = import_excel_from_dataframe(df, 'douyin.xlsx')
+        assert result['success'] is True
+        # 主订单 DY0001 含 2 个子订单行，子订单编号作订单号 → 3 行全部入库（不合并）
+        assert result['stats']['成功导入'] == 3
+
+        insert_sqls = [str(c.args[0]) for c in mock_conn.execute.call_args_list]
+        assert any('platform' in s for s in insert_sqls)
+
+        # 应有一行参数 platform=2
+        platform_vals = [c.args[1].get('platform') for c in mock_conn.execute.call_args_list
+                         if isinstance(c.args[1], dict)]
+        assert 2 in platform_vals
+
+        # 订单号取子订单编号：DY002 子订单独立入库，不被同父订单 DY001 覆盖
+        order_nos = [c.args[1].get('order_no') for c in mock_conn.execute.call_args_list
+                     if isinstance(c.args[1], dict) and c.args[1].get('order_no') is not None]
+        assert 'DY001' in order_nos and 'DY002' in order_nos and 'DY003' in order_nos
