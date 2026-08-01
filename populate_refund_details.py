@@ -2,18 +2,19 @@
 import pandas as pd
 from sqlalchemy import text
 from mysql_conn import engine
-from make_daily import extract_flower_from_spec, extract_meter_from_spec
+from make_daily import extract_meter_from_spec, assign_flowers, load_cost_map
 
-def sync_refund_details():
+def sync_refund_details(cost_map=None):
     print("📋 正在同步退款明细...")
 
     with engine.connect() as conn:
         # 查询已发货（order_status 包含“已发货”）且退款成功（after_sale_status 包含“退款成功”）的订单
         df = pd.read_sql(
             text("""
-                SELECT 
-                    order_no, 
-                    product_spec, 
+                SELECT
+                    order_no,
+                    product,
+                    product_spec,
                     product_quantity,
                     merchant_income,
                     after_sale_status,
@@ -31,15 +32,19 @@ def sync_refund_details():
 
         print(f"📦 找到 {len(df)} 条退款记录")
 
+        # 花型与日报口径一致：四层匹配到成本表花型，匹配不上的归入「未匹配」
+        if cost_map is None:
+            cost_map = load_cost_map()
+        df = assign_flowers(df, set(cost_map.keys()))
+
         # 提取花型和米数
-        df['flower'] = df['product_spec'].apply(extract_flower_from_spec)
         df['meters'] = df['product_spec'].apply(extract_meter_from_spec)
         df.loc[df['meters'] == 0, 'meters'] = 1
         df['refund_meters'] = df['meters'] * df['product_quantity']
         df['refund_amount'] = df['merchant_income'].round(2)
 
         # 按 (order_no, flower) 分组聚合
-        grouped = df.groupby(['order_no', 'flower'], as_index=False).agg({
+        grouped = df.groupby(['order_no', '花型'], as_index=False).agg({
             'refund_meters': 'sum',
             'refund_amount': 'sum',
             'product_spec': 'first',
@@ -54,8 +59,8 @@ def sync_refund_details():
         total = 0
         for _, row in grouped.iterrows():
             sql = text("""
-                INSERT INTO refund_detail 
-                (order_no, flower, product_spec, product_quantity, 
+                INSERT INTO refund_detail
+                (order_no, flower, product_spec, product_quantity,
                  refund_meters, refund_amount, after_sale_status, refund_time)
                 VALUES (:order_no, :flower, :spec, :qty, :meters, :amount, :status, :time)
                 ON DUPLICATE KEY UPDATE
@@ -68,7 +73,7 @@ def sync_refund_details():
             """)
             conn.execute(sql, {
                 "order_no": row['order_no'],
-                "flower": row['flower'],
+                "flower": row['花型'],
                 "spec": row['product_spec'],
                 "qty": int(row['product_quantity']),
                 "meters": float(row['refund_meters']),
