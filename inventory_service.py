@@ -81,9 +81,12 @@ def _daily_inbound(conn, flower, d):
 
 
 def _daily_adjust(conn, flower, d, exclude_ref_prefix=None):
-    """当日手动调整合计。按生效日期 effect_date 归集。exclude_ref_prefix 用于排除本次调整自身写入的流水。"""
+    """当日手动调整合计。按生效日期 effect_date 归集。exclude_ref_prefix 用于排除本次调整自身写入的流水。
+    始终排除「回退日报」系统日志——那是重新生成日报时撤销旧扣减产生的对销记录，
+    其正向 change_qty 与当天重新扣减的销售出库相抵，若计入会虚增当天快照。"""
     sql = ("SELECT COALESCE(SUM(change_qty), 0) FROM inventory_log "
-           "WHERE flower = :f AND change_type = '手动调整' AND COALESCE(effect_date, DATE(created_at)) = :d")
+           "WHERE flower = :f AND change_type = '手动调整' AND COALESCE(effect_date, DATE(created_at)) = :d"
+           " AND (reference NOT LIKE '回退日报%' OR reference IS NULL)")
     params = {"f": flower, "d": d}
     if exclude_ref_prefix:
         sql += " AND (reference NOT LIKE :excl OR reference IS NULL)"
@@ -318,11 +321,15 @@ def add_stock(flower, qty, reference="手动入库", operator="system", target_d
 # =============================================
 # 核心功能 2：销售出库（减少库存）
 # =============================================
-def deduct_stock(flower, qty, reference="销售出库", operator="system", report_date=None):
+def deduct_stock(flower, qty, reference="销售出库", operator="system", report_date=None, is_daily_sales=False):
     """
     手动出库：直接扣减库存，同时更新 inventory 和 inventory_snapshot
     report_date: 出库日期。只影响该日期到下一个锚点（is_manual=1）之前的快照，
     不会越过锚点改变锚点之后日期的库存。库存不会低于 0。
+    is_daily_sales: 日报自动扣减路径（True 时 qty 即当日销售米数）。快照补全逻辑
+    会把当天销售烘焙进 snapshot[report_date]（end-of-day 语义），若日报扣减再以该
+    快照为基准减去 qty 会双重扣减。故以 snapshot[report_date-1] 为基准，结合当日
+    出入库/调整自愈重算，保证日报可反复重新生成而不累积误差。
     """
     if qty <= 0:
         raise ValueError("出库数量必须大于 0")
@@ -336,6 +343,17 @@ def deduct_stock(flower, qty, reference="销售出库", operator="system", repor
     with engine.connect() as conn:
         trans = conn.begin()
         try:
+            # 0. 日报路径：若 report_date 为手动锚点（is_manual=1），锚点是实盘数、
+            #    已含当日销售，任何公式扣减都会破坏锚点，直接跳过
+            if is_daily_sales:
+                anchor_row = conn.execute(
+                    text("SELECT is_manual FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+                    {"f": flower, "d": report_date}
+                ).fetchone()
+                if anchor_row is not None and anchor_row[0]:
+                    print(f"⏭️ {flower} {report_date} 为手动锚点（is_manual=1），日报扣减跳过，锚点为实盘数")
+                    return
+
             # 1. 确保目标日期及之后有快照记录（沿用原逻辑，缺失时先补全）
             check_snapshot = conn.execute(
                 text("SELECT COUNT(*) FROM inventory_snapshot WHERE flower = :f AND snapshot_date >= :d"),
@@ -347,27 +365,49 @@ def deduct_stock(flower, qty, reference="销售出库", operator="system", repor
                 from inventory_service import fill_missing_snapshots
                 fill_missing_snapshots(operator=operator)
 
-            # 2. 读取 report_date 快照旧值（无则推算创建），用于日志与扣减基准
-            snap_before_row = conn.execute(
-                text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
-                {"f": flower, "d": report_date}
-            ).fetchone()
-            if snap_before_row is not None:
-                snap_before = float(snap_before_row[0])
+            # 2. 确定扣减基准
+            if is_daily_sales:
+                # 日报路径：snapshot[report_date] 可能已被补全逻辑烘焙成含当天销售的
+                # end-of-day 值，不能直接作为基准。以 snapshot[report_date-1] 推算
+                # 当日 end-of-day，实现自愈（可反复重新生成，不累积双重扣减）。
+                prev_date = report_date - timedelta(days=1)
+                prev_row = conn.execute(
+                    text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+                    {"f": flower, "d": prev_date}
+                ).fetchone()
+                if prev_row is not None:
+                    snap_before = float(prev_row[0])
+                else:
+                    snap_before = _ensure_snapshot_stock(conn, flower, prev_date, operator)
+                snap_after = max(
+                    snap_before - qty
+                    + _daily_inbound(conn, flower, report_date)
+                    + _daily_adjust(conn, flower, report_date),
+                    0
+                )
+                actual_deduct = qty
             else:
-                snap_before = _ensure_snapshot_stock(conn, flower, report_date, operator)
+                # 手动路径：读取 report_date 快照旧值（无则推算创建），用于日志与扣减基准
+                snap_before_row = conn.execute(
+                    text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+                    {"f": flower, "d": report_date}
+                ).fetchone()
+                if snap_before_row is not None:
+                    snap_before = float(snap_before_row[0])
+                else:
+                    snap_before = _ensure_snapshot_stock(conn, flower, report_date, operator)
+                snap_after = max(snap_before - qty, 0)
+                actual_deduct = snap_before - snap_after
 
-            snap_after = max(snap_before - qty, 0)
-            actual_deduct = snap_before - snap_after
-
-            # 3. 更新 report_date 快照（扣减，不低于 0）
+            # 3. 更新 report_date 快照（扣减，不低于 0；无则插入，保留 is_manual 原值）
             conn.execute(
                 text("""
-                    UPDATE inventory_snapshot
-                    SET stock = :new, updated_by = :op, updated_at = CURRENT_TIMESTAMP
-                    WHERE flower = :f AND snapshot_date = :d
+                    INSERT INTO inventory_snapshot (flower, snapshot_date, stock, is_manual, updated_by, updated_at)
+                    VALUES (:f, :d, :new, 0, :op, CURRENT_TIMESTAMP)
+                    ON DUPLICATE KEY UPDATE stock = :new2, updated_by = :op2, updated_at = CURRENT_TIMESTAMP
                 """),
-                {"new": snap_after, "op": operator, "f": flower, "d": report_date}
+                {"f": flower, "d": report_date, "new": snap_after, "op": operator,
+                 "new2": snap_after, "op2": operator}
             )
 
             # 4. 确定重算区间（report_date 之后到下一个锚点之前）

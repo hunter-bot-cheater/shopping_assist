@@ -796,33 +796,44 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
                 ).fetchone()
                 before_stock = float(before_row[0]) if before_row else 0
 
+                # 若 target_date 为手动锚点（is_manual=1），锚点是实盘数、已含当日销售，
+                # 日报扣减本来就跳过它（deduct_stock is_daily_sales 路径），无需回退。
+                anchor_flag = conn.execute(
+                    text("SELECT is_manual FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+                    {"f": flower, "d": target_date}
+                ).fetchone()
+                if anchor_flag is not None and anchor_flag[0]:
+                    print(f"  ⏭️ {flower} {target_date} 为手动锚点，跳过回退")
+                    continue
+
                 # 回退实时库存
                 conn.execute(
                     text("UPDATE inventory SET current_stock = current_stock + :qty WHERE flower = :f"),
                     {"qty": prev_meters, "f": flower}
                 )
-                # 回退快照（从 target_date 起所有快照 +prev_meters）
+                # 回退快照（从 target_date 起所有快照 +prev_meters，不碰手动锚点）
                 conn.execute(
                     text("""
                         UPDATE inventory_snapshot
                         SET stock = stock + :qty, updated_by = 'system', updated_at = CURRENT_TIMESTAMP
-                        WHERE flower = :f AND snapshot_date >= :d
+                        WHERE flower = :f AND snapshot_date >= :d AND is_manual = 0
                     """),
                     {"qty": prev_meters, "f": flower, "d": target_date}
                 )
-                # 写入回退日志
+                # 写入回退日志（effect_date 归集到被回退的那天，避免错位污染执行日）
                 conn.execute(
                     text("""
                         INSERT INTO inventory_log
-                        (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
-                        VALUES (:f, '手动调整', :qty, :before, :after, :ref, :op)
+                        (flower, change_type, change_qty, before_stock, after_stock, reference, operator, effect_date)
+                        VALUES (:f, '手动调整', :qty, :before, :after, :ref, :op, :eff)
                     """),
                     {
                         "f": flower, "qty": prev_meters,
                         "before": before_stock,
                         "after": before_stock + prev_meters,
                         "ref": f"回退日报 {target_date}（重新生成）",
-                        "op": "system"
+                        "op": "system",
+                        "eff": target_date
                     }
                 )
                 rollback_count += 1
@@ -846,7 +857,8 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
                     qty=current_meters,
                     reference=f"日报自动扣减 {target_date}",
                     operator="system",
-                    report_date=target_date
+                    report_date=target_date,
+                    is_daily_sales=True
                 )
                 deducted_count += 1
                 print(f"  ✅ {flower}: 扣减 {current_meters:.1f} 米")
