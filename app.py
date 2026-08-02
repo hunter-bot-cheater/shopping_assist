@@ -1048,37 +1048,33 @@ elif menu == "⚙️ 系统设置":
         st.write("")
         st.write("")
         if st.button("✅ 确认修改起始日期", type="primary", use_container_width=True):
-            if new_start_date > datetime.now().date():
-                st.error("❌ 起始日期不能晚于今天")
-            else:
-                # 确认修改
-                confirm = st.checkbox("我确认修改起始日期，系统将重新生成快照")
-                if confirm:
-                    with st.spinner("正在修改起始日期并重新生成快照..."):
-                        # 1. 更新配置
-                        set_system_start_date(new_start_date)
+            st.session_state['pending_start_date_change'] = True
 
-                        # 2. 清空快照并重新初始化
-                        with engine.connect() as conn:
-                            conn.execute(text("TRUNCATE TABLE inventory_snapshot"))
-                            conn.commit()
+    # 按钮点击后显示确认复选框（session_state 持久化状态）
+    if st.session_state.get('pending_start_date_change'):
+        if new_start_date > datetime.now().date():
+            st.error("❌ 起始日期不能晚于今天")
+            st.session_state['pending_start_date_change'] = False
+        else:
+            confirm = st.checkbox("我确认修改起始日期，系统将重新生成快照")
+            if confirm:
+                with st.spinner("正在修改起始日期并重新生成快照..."):
+                    set_system_start_date(new_start_date)
 
-                        # 3. 🔧 修正：重新生成快照，并处理返回值
-                        filled, fill_status, msg = fill_missing_snapshots(operator="system")
+                    with engine.connect() as conn:
+                        conn.execute(text("TRUNCATE TABLE inventory_snapshot"))
+                        conn.commit()
 
-                        if fill_status == "no_report":
-                            st.warning(f"✅ 起始日期已更新为 {new_start_date.strftime('%Y-%m-%d')}，但 {msg}")
-                        elif fill_status == "already_latest":
-                            st.info(f"✅ 起始日期已更新为 {new_start_date.strftime('%Y-%m-%d')}，{msg}")
-                        elif fill_status == "error":
-                            st.error(f"❌ 起始日期已更新，但快照生成失败：{msg}")
-                        else:
-                            st.success(f"✅ 起始日期已更新为 {new_start_date.strftime('%Y-%m-%d')}，{msg}")
-                            st.balloons()
+                    filled, fill_status, msg = fill_missing_snapshots(operator="system")
 
-                        st.rerun()
-                else:
-                    st.warning("⚠️ 请先勾选确认复选框")
+                    if fill_status == "error":
+                        st.error(f"❌ 快照生成失败：{msg}")
+                    else:
+                        st.success(f"✅ 起始日期已更新为 {new_start_date.strftime('%Y-%m-%d')}，{msg}")
+                        st.balloons()
+
+                st.session_state['pending_start_date_change'] = False
+                st.rerun()
 
     st.divider()
 
@@ -1116,22 +1112,21 @@ elif menu == "⚙️ 系统设置":
             {"start": current_start_date}
         ).fetchone()
 
+    def _fmt_date(val):
+        """安全格式化日期值：date 对象用 strftime，字符串直接用，None → '无'"""
+        if val is None:
+            return '无'
+        if isinstance(val, str):
+            return val
+        return val.strftime('%Y-%m-%d')
+
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric(
-            "📋 订单数据",
-            f"{order_range[0].strftime('%Y-%m-%d') if order_range[0] else '无'} ~ {order_range[1].strftime('%Y-%m-%d') if order_range[1] else '无'}"
-        )
+        st.metric("📋 订单数据", f"{_fmt_date(order_range[0])} ~ {_fmt_date(order_range[1])}")
     with col2:
-        st.metric(
-            "📊 日报数据",
-            f"{report_range[0].strftime('%Y-%m-%d') if report_range[0] else '无'} ~ {report_range[1].strftime('%Y-%m-%d') if report_range[1] else '无'}"
-        )
+        st.metric("📊 日报数据", f"{_fmt_date(report_range[0])} ~ {_fmt_date(report_range[1])}")
     with col3:
-        st.metric(
-            "📸 库存快照",
-            f"{snapshot_range[0].strftime('%Y-%m-%d') if snapshot_range[0] else '无'} ~ {snapshot_range[1].strftime('%Y-%m-%d') if snapshot_range[1] else '无'}"
-        )
+        st.metric("📸 库存快照", f"{_fmt_date(snapshot_range[0])} ~ {_fmt_date(snapshot_range[1])}")
 elif menu == "🌸 花型管理":
     st.header("🌸 花型管理")
     st.caption("支持新增花型、软删除花型（历史数据保留）、恢复已删除花型")
