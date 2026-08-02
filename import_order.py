@@ -40,6 +40,7 @@ COLUMN_MAPPING = {
     "售后状态": "after_sale_status",
     "快递单号": "express_no",
     "快递公司": "express_company",
+    "parent_order_no": "parent_order_no",
     "订单成交时间": "order_time",
     "是否分期": "installment",
     "分期期数": "installment_periods",
@@ -73,6 +74,8 @@ PLATFORM_COLUMN_MAPPINGS = {
         '退款金额': '_temp_refund_amount', '订单关闭原因': '_temp_close_reason',
     },
     PLATFORM_DOUYIN: {
+        # 同一主订单的多个子订单行共用主订单编号，作为合并发货计快递费的标识
+        '主订单编号': 'parent_order_no',
         # 用子订单编号作订单号：抖音一个主订单含多个子订单行，主订单编号会使
         # 同父订单多行 UPSERT 互相覆盖导致丢数据；子订单编号全文件唯一(206/206)
         '子订单编号': '订单号',
@@ -92,7 +95,7 @@ DATETIME_COLUMNS = ["发货时间", "确认收货时间", "订单成交时间"]
 TEXT_COLUMNS = [
     "商品", "订单号", "订单状态", "商品规格", "商家编码-规格维度",
     "商家编码-商品维度", "商家备注", "售后状态", "快递单号", "快递公司",
-    "是否分期", "手续费承担方", "分期方式"
+    "是否分期", "手续费承担方", "分期方式", "parent_order_no"
 ]
 
 
@@ -277,6 +280,35 @@ def ensure_platform_column():
     except Exception as e:
         return False, f"自动迁移失败，请手动运行 python migrate_platform.py：{e}"
 
+def parent_order_no_column_exists():
+    """检查 data2026 表是否已有 parent_order_no 列。"""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sqlalchemy.text(f"SHOW COLUMNS FROM {orders} LIKE 'parent_order_no'")
+            ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+def ensure_parent_order_no_column():
+    """确保 data2026 表有 parent_order_no 列，缺失时自动添加（幂等，可安全重复调用）。
+    返回 (ok, message)；ok=True 时 message 仅在本次执行了迁移时非空。"""
+    if parent_order_no_column_exists():
+        return True, ""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sqlalchemy.text(f"""
+                    ALTER TABLE {orders}
+                    ADD COLUMN parent_order_no VARCHAR(50) NULL
+                    COMMENT '父订单号（抖音主订单编号）' AFTER platform
+                """)
+            )
+        return True, "✅ 已自动为 data2026 表添加 parent_order_no 字段（迁移完成）"
+    except Exception as e:
+        return False, f"自动迁移失败，请手动运行 python migrate_parent_order.py：{e}"
+
 # ============================
 # 主导入函数（改为 UPSERT）
 # ============================
@@ -343,6 +375,14 @@ def import_excel(file_path=None):
         return
     if migrate_msg:
         print(migrate_msg)
+
+    # 确保有 parent_order_no 列（抖音主订单编号，缺失时自动迁移）
+    ok2, migrate_msg2 = ensure_parent_order_no_column()
+    if not ok2:
+        print(f"错误：{migrate_msg2}")
+        return
+    if migrate_msg2:
+        print(migrate_msg2)
 
     # 5. 按字段映射重命名
     existing_cols = [col for col in COLUMN_MAPPING.keys() if col in df.columns]
@@ -758,6 +798,18 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
             }
         if migrate_msg:
             print(migrate_msg)
+
+        # 确保有 parent_order_no 列（抖音主订单编号，缺失时自动迁移）
+        ok2, migrate_msg2 = ensure_parent_order_no_column()
+        if not ok2:
+            return {
+                "success": False,
+                "message": migrate_msg2,
+                "stats": {},
+                "changes": None,
+            }
+        if migrate_msg2:
+            print(migrate_msg2)
 
         # ============================================================
         # 第四步：按字段映射重命名（标准列名 -> 数据库字段名）

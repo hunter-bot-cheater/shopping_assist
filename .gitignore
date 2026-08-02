@@ -14,7 +14,7 @@ _verify_alias.py
 alter_table_add_platform.sql
 migrate_platform.py
 fix_inventory_effect_date.py
-
+migrate_parent_order.py
 
 #.coverage相关
 .coverage

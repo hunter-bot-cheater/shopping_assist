@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timedelta
 from sqlalchemy import text
 from mysql_conn import engine
-from import_order import orders, PLATFORM_NAMES, extract_flower_from_spec
+from import_order import orders, PLATFORM_NAMES, PLATFORM_DOUYIN, extract_flower_from_spec
 from inventory_service import deduct_stock, get_missing_report_dates
 
 # ============================
@@ -215,6 +215,18 @@ def assign_flowers(df, cost_flowers):
     return df
 
 
+def get_order_key(row):
+    """同一单（合并发货）的唯一标识：抖音按主订单编号，拼多多/淘宝按快递单号。
+    单号为空/NaN 时回落为 order_no（每单单独计费）。"""
+    if row.get('platform') == PLATFORM_DOUYIN:
+        key = row.get('parent_order_no')
+    else:
+        key = row.get('express_no')
+    if key is None or pd.isna(key) or (isinstance(key, str) and not key.strip()):
+        return row.get('order_no')
+    return key
+
+
 def _match_flowers_and_calc(df, cost_map):
     """花型四层匹配 + 米数/成本/快递费/盈利 + 退款标记 + 平台名。
 
@@ -289,9 +301,29 @@ def _match_flowers_and_calc(df, cost_map):
     # ============================================================
     # 快递费和盈利
     # ============================================================
+    # 发货包号：同一 order_key 属同一包裹（合并发货），按首次出现顺序编号
+    df['order_key'] = df.apply(get_order_key, axis=1)
+    seen, key_to_no, pkg_no = set(), {}, 0
+    for key in df['order_key']:
+        if key not in seen:
+            seen.add(key)
+            pkg_no += 1
+            key_to_no[key] = pkg_no
+    df['发货包号'] = df['order_key'].map(key_to_no)
+
+    # 快递费按包计费：只记在该包第一行，其余行 0，保证汇总不重复计算
     df['快递费'] = 0.0
-    first_order = df.drop_duplicates('order_no').index
-    df.loc[first_order, '快递费'] = POSTAGE_PER_ORDER
+    for key, group in df.groupby('order_key', sort=False, dropna=False):
+        first_idx = group.index[0]
+        first_postage = group.iloc[0].get('postage')
+        fee = POSTAGE_PER_ORDER
+        try:
+            if first_postage is not None and float(first_postage) > 0:
+                fee = float(first_postage)
+        except (TypeError, ValueError):
+            pass
+        df.loc[first_idx, '快递费'] = fee
+    df = df.drop(columns=['order_key'])
     df['盈利'] = (df['merchant_income'] - df['成本'] - df['快递费']).round(2)
 
     # ============================================================
@@ -585,7 +617,8 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
             id, order_no, product, product_spec,
             product_quantity, merchant_income,
             cost, meter, express_cost, traffic_cost, profit,
-            after_sale_status, order_status, platform
+            after_sale_status, order_status, platform,
+            express_no, postage, parent_order_no
         FROM {orders}
         WHERE DATE(delivery_time) = :target_date
           AND delivery_time IS NOT NULL
@@ -647,7 +680,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # ============================================================
     # 明细表
     # ============================================================
-    detail_cols = ['花型', '平台', '成本', '米数', 'merchant_income', '快递费', '盈利',
+    detail_cols = ['花型', '平台', '发货包号', '成本', '米数', 'merchant_income', '快递费', '盈利',
                    'after_sale_status', 'order_no', 'product_spec', 'product_quantity', '是否退款']
     detail = detail_df[detail_cols].copy()
     detail = detail.rename(columns={
@@ -951,7 +984,8 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
             id, order_no, product, product_spec,
             product_quantity, merchant_income,
             cost, meter, express_cost, traffic_cost, profit,
-            after_sale_status, order_status, platform
+            after_sale_status, order_status, platform,
+            express_no, postage, parent_order_no
         FROM {orders}
         WHERE delivery_time >= :start_date
           AND delivery_time < DATE_ADD(:end_date, INTERVAL 1 DAY)
@@ -999,7 +1033,7 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
     detail_df.loc[detail_df['是否退款'] == True, ['成本', '米数']] = 0
 
     # 明细表
-    detail_cols = ['花型', '平台', '成本', '米数', 'merchant_income', '快递费', '盈利',
+    detail_cols = ['花型', '平台', '发货包号', '成本', '米数', 'merchant_income', '快递费', '盈利',
                    'after_sale_status', 'order_no', 'product_spec', 'product_quantity', '是否退款']
     detail = detail_df[detail_cols].copy()
     detail = detail.rename(columns={
