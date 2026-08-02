@@ -587,12 +587,8 @@ elif menu == "📊 报告生成":
     st.subheader("📝 生成日报")
     st.info("💡 每次生成都会强制覆盖已有日报，先回退旧库存，再基于最新订单数据重新扣减")
 
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        gen_date = st.date_input("选择日期", value=date.today())
-    with col2:
-        gen_btn = st.button("🚀 生成日报", type="primary", use_container_width=True)
-
+    gen_date = st.date_input("选择日期", value=date.today())
+    gen_btn = st.button("🚀 生成日报", type="primary")
     if gen_btn:
         from make_daily import generate_daily_report
 
