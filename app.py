@@ -2,7 +2,7 @@
 import os
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from inventory_service import (
     get_inventory_report,
     add_stock,
@@ -44,7 +44,7 @@ menu = st.sidebar.radio(
 
     ["🏠 首页", "📤 导入订单","📦 库存管理", "📥 入库登记", "📤 出库登记","🌸 花型管理",
 
-     "📋 库存流水", "🚨 预警中心", "📊 日报中心","📊 退款明细", "⚙️ 系统设置"]
+     "📋 库存流水", "🚨 预警中心", "📊 报告生成","📊 退款明细", "⚙️ 系统设置"]
 )
 st.sidebar.markdown("---")
 st.sidebar.caption(f"当前时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -580,8 +580,8 @@ elif menu == "🚨 预警中心":
                     st.success("✅ 所有花型库存充足，暂无补货预警")
                     st.caption(f"📊 当前监控花型数：{len(inv_df)} 个（已排除已删除花型）")
 
-elif menu == "📊 日报中心":
-    st.header("📊 日报与报表")
+elif menu == "📊 报告生成":
+    st.header("📊 报告生成")
 
     # ---------- 在线生成日报 ----------
     st.subheader("📝 生成日报")
@@ -646,6 +646,41 @@ elif menu == "📊 日报中心":
                         )
                 else:
                     st.warning(f"生成完成，但未找到文件，请检查目录：{filepath}")
+            except Exception as e:
+                st.error(f"❌ 生成失败：{e}")
+
+    st.divider()
+
+    # ---------- 出库入库明细 ----------
+    st.subheader("📦 出库入库明细")
+    st.info("💡 按日期范围生成每个花型的每日出库/入库明细（期初库存 = 开始日期前一天快照，入库按生效日期归集）")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        inout_start = st.date_input("开始日期", value=date.today() - timedelta(days=30),key="inout_start_date" )
+    with col2:
+        inout_end = st.date_input("结束日期", value=date.today(),key="inout_end_date" )
+
+    if st.button("🚀 生成报表", type="primary"):
+        from make_report import generate_inout_detail_report
+
+        with st.spinner(f"正在生成 {inout_start} 至 {inout_end} 的出库入库明细..."):
+            try:
+                filepath = generate_inout_detail_report(inout_start, inout_end)
+                if filepath and os.path.exists(filepath):
+                    st.success("✅ 出库入库明细生成成功！")
+                    with open(filepath, "rb") as f:
+                        st.download_button(
+                            label="📥 下载出库入库明细 Excel",
+                            data=f,
+                            file_name=os.path.basename(filepath),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="download_inout_btn"
+                        )
+                else:
+                    st.warning(f"生成完成，但未找到文件，请检查目录：{filepath}")
+            except ValueError as e:
+                st.error(f"❌ {e}")
             except Exception as e:
                 st.error(f"❌ 生成失败：{e}")
 

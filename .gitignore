@@ -13,6 +13,7 @@ _test_upload.py
 _verify_alias.py
 alter_table_add_platform.sql
 migrate_platform.py
+fix_inventory_effect_date.py
 
 
 #.coverage相关
