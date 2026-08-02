@@ -101,10 +101,10 @@ def init_inventory_all_flowers(default_stock=200, operator="system"):
 
 if __name__ == "__main__":
     # 初始化所有花型库存为 200 米
-    init_inventory_all_flowers(default_stock=2000, operator="admin")
+    init_inventory_all_flowers(default_stock=0, operator="admin")
     success, msg = init_inventory_base(
         base_date='2026-07-01',
-        base_stock=2000,
+        base_stock=0,
         operator='admin'
     )
     print(msg)

@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS inventory_log (
     after_stock DECIMAL(10,2),
     reference VARCHAR(255),
     operator VARCHAR(50),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    effect_date DATE NULL COMMENT '生效日期：该操作实际作用的库存日期；NULL 时按 created_at 的日期计'
 );
 
 -- 5. 日报缓存表
@@ -157,6 +158,7 @@ CREATE TABLE IF NOT EXISTS inventory_snapshot (
     flower VARCHAR(100) NOT NULL,
     snapshot_date DATE NOT NULL,
     stock DECIMAL(10,2) NOT NULL DEFAULT 0,
+    is_manual TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否为手动调整锚点：0-自动计算，1-手动调整（锚点，库存值固定）',
     updated_by VARCHAR(50) DEFAULT 'system',
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_flower_date (flower, snapshot_date)
