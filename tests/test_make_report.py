@@ -73,7 +73,7 @@ def test_generate_report_structure(tmp_path, mock_engine_conn):
     assert ws['E2'].value == 2
     assert ws['A3'].value == '6月30日库存'
     assert ws['B3'].value == '花型名称'
-    assert ws[f'{out_letter}3'].value == '出库总数'
+    assert ws[f'{out_letter}3'].value == '总出入库'
     assert ws[f'{bal_letter}3'].value == '库存余额'
 
     # 花型A：期初100，7/1出库10 7/2出库5，出库总数15，入库7/1=20，余额=100+20-15=105
@@ -91,11 +91,11 @@ def test_generate_report_structure(tmp_path, mock_engine_conn):
     merges = {str(r) for r in ws.merged_cells.ranges}
     assert 'A4:A5' in merges and 'B4:B5' in merges and f'{bal_letter}4:{bal_letter}5' in merges
     assert ws['D4'].number_format == '0.0'
-    assert ws[f'{out_letter}4'].font.bold is True
+    assert ws[f'{out_letter}4'].font.color.rgb == '00FF0000'
     assert ws['A3'].fill.fgColor.rgb == '00D9E1F2'
 
     # 固定紧凑列宽
-    assert ws.column_dimensions['A'].width == 7
+    assert ws.column_dimensions['A'].width == 11
     assert ws.column_dimensions['B'].width == 12
     assert ws.column_dimensions['D'].width == 6
     assert ws.column_dimensions[out_letter].width == 8

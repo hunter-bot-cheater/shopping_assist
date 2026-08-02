@@ -20,6 +20,7 @@ from import_order import (
     PLATFORM_PDD,
     PLATFORM_TAOBAO,
     PLATFORM_DOUYIN,
+    PLATFORM_COLUMN_MAPPINGS,
 )
 
 
@@ -364,6 +365,13 @@ class TestDouyinImport:
         })
         assert detect_platform(df) == PLATFORM_DOUYIN
 
+    def test_douyin_mapping_has_parent_order_no(self):
+        """抖音映射含 主订单编号 → parent_order_no；淘宝映射不含（淘宝用快递单号）。"""
+        assert PLATFORM_COLUMN_MAPPINGS[PLATFORM_DOUYIN]['主订单编号'] == 'parent_order_no'
+        assert '主订单编号' not in PLATFORM_COLUMN_MAPPINGS[PLATFORM_TAOBAO]
+        # 淘宝/拼多多用快递单号判断同一单：淘宝映射含 物流单号 → 快递单号
+        assert PLATFORM_COLUMN_MAPPINGS[PLATFORM_TAOBAO]['物流单号'] == '快递单号'
+
     def test_after_sale_status_completed_no_refund(self):
         """已完成且无退款 → None。"""
         row = {'订单状态': '已完成', '售后状态': '-', '_temp_close_reason': '',
@@ -445,3 +453,8 @@ class TestDouyinImport:
         order_nos = [c.args[1].get('order_no') for c in mock_conn.execute.call_args_list
                      if isinstance(c.args[1], dict) and c.args[1].get('order_no') is not None]
         assert 'DY001' in order_nos and 'DY002' in order_nos and 'DY003' in order_nos
+
+        # 主订单编号持久化为 parent_order_no：DY0001 两行 + DY0002 一行
+        parent_vals = [c.args[1].get('parent_order_no') for c in mock_conn.execute.call_args_list
+                       if isinstance(c.args[1], dict) and c.args[1].get('parent_order_no') is not None]
+        assert sorted(parent_vals) == ['DY0001', 'DY0001', 'DY0002']

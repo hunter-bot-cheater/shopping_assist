@@ -18,6 +18,7 @@ USE shop_data;
 CREATE TABLE IF NOT EXISTS data2026 (
     id INT AUTO_INCREMENT PRIMARY KEY,
     platform TINYINT(1) NOT NULL DEFAULT 0 COMMENT '订单来源平台: 0=拼多多, 1=淘宝, 2=抖音(预留)',
+    parent_order_no VARCHAR(50) NULL COMMENT '父订单号（抖音主订单编号）',
     product VARCHAR(255),
     order_no VARCHAR(50) UNIQUE,
     order_status VARCHAR(20),

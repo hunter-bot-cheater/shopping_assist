@@ -19,6 +19,8 @@ from make_daily import (
     generate_range_report,
     build_platform_summary,
     ensure_output_dir,
+    get_order_key,
+    _match_flowers_and_calc,
 )
 
 
@@ -221,9 +223,10 @@ class TestPlatformGrouping:
                 assert douyin_row['订单数'] == 0
                 assert douyin_row['营业额'] == 0
 
-                # 订单明细含平台列
+                # 订单明细含平台列与发货包号列
                 detail = pd.read_excel(xf, '订单明细')
                 assert '平台' in detail.columns
+                assert '发货包号' in detail.columns
 
 
 # ===========================================================================
@@ -316,6 +319,45 @@ class TestGenerateRangeReport:
                 assert head.iloc[0, 9] == '淘宝'
                 assert head.iloc[0, 17] == '抖音'
                 assert head.iloc[0, 25] == '汇总'
+
+    def test_range_report_shipping_fee_per_package(self, tmp_path):
+        """区间报告明细含 发货包号 列，同一快递单号合并发货只记一份快递费。"""
+        order_df = pd.DataFrame({
+            'id': [1, 2, 3],
+            'order_no': ['ORD001', 'ORD002', 'ORD003'],
+            'product': ['花型A布料', '花型A布料', '花型A布料'],
+            'product_spec': ['花型A,2米', '花型A,2米', '花型A,2米'],
+            'product_quantity': [1, 1, 1],
+            'merchant_income': [50.0, 40.0, 30.0],
+            'cost': [0.0, 0.0, 0.0],
+            'meter': [0.0, 0.0, 0.0],
+            'express_cost': [0.0, 0.0, 0.0],
+            'traffic_cost': [0.0, 0.0, 0.0],
+            'profit': [0.0, 0.0, 0.0],
+            'after_sale_status': ['', '', ''],
+            'order_status': ['已发货', '已发货', '已发货'],
+            'platform': [0, 0, 0],
+            'express_no': ['EX001', 'EX001', 'EX002'],
+            'postage': [0.0, 0.0, 0.0],
+            'parent_order_no': [None, None, None],
+        })
+
+        with patch('make_daily.OUTPUT_DIR', str(tmp_path)), \
+             patch('make_daily.engine') as mock_engine, \
+             patch('pandas.read_sql', return_value=order_df), \
+             patch('make_daily.load_cost_map', return_value={'花型A': 10.0}):
+            mock_engine.connect.return_value = _make_mock_connection()
+
+            result = generate_range_report('2026-07-01', '2026-07-15', force=True)
+            with pd.ExcelFile(result) as xf:
+                detail = pd.read_excel(xf, '订单明细')
+
+            assert '发货包号' in detail.columns
+            # EX001 合并发货：两行同包，仅第一行记快递费；EX002 单独一包记一份
+            grp = detail.groupby('发货包号')['快递费'].sum()
+            assert len(grp) == 2
+            assert (grp == 2.5).all()
+            assert detail['快递费'].sum() == 5.0
 
     def test_range_report_counts_shipped_taobao(self, tmp_path):
         """发货且不退款的淘宝订单计入，不因 merchant_income=0 被排除。"""
@@ -447,3 +489,65 @@ class TestEnsureOutputDir:
         mock_exists.return_value = False
         ensure_output_dir()
         mock_makedirs.assert_called_once()
+
+
+# ===========================================================================
+# 快递费（按平台规则：抖音按主订单编号，拼多多/淘宝按快递单号）
+# ===========================================================================
+
+class TestShippingFee:
+
+    def test_get_order_key_pdd_uses_express_no(self):
+        """拼多多/淘宝按快递单号判断同一单。"""
+        row = {'platform': 0, 'express_no': 'SF123', 'parent_order_no': 'P1', 'order_no': 'ORD1'}
+        assert get_order_key(row) == 'SF123'
+
+    def test_get_order_key_douyin_uses_parent_order(self):
+        """抖音按主订单编号判断同一单。"""
+        row = {'platform': 2, 'express_no': 'SN1', 'parent_order_no': 'DY1', 'order_no': 'SUB1'}
+        assert get_order_key(row) == 'DY1'
+
+    def test_get_order_key_fallback_to_order_no(self):
+        """单号为空/NaN（无快递单号/无主订单编号）回落为 order_no，每单单独计费。"""
+        assert get_order_key({'platform': 0, 'express_no': '', 'order_no': 'ORD1'}) == 'ORD1'
+        assert get_order_key({'platform': 2, 'parent_order_no': None, 'order_no': 'ORD2'}) == 'ORD2'
+        assert get_order_key({'platform': 0, 'express_no': float('nan'), 'order_no': 'ORD3'}) == 'ORD3'
+
+    def test_shipping_fee_grouped_by_platform(self):
+        """同一单多行只算 1 份快递费；postage>0 用实际值，否则用固定值。"""
+        order_df = pd.DataFrame({
+            'id': [1, 2, 3, 4, 5, 6],
+            'order_no': ['A1', 'A2', 'A3', 'A4', 'A5', 'A6'],
+            'product': ['花型A布料'] * 6,
+            'product_spec': ['花型A,2米'] * 6,
+            'product_quantity': [1] * 6,
+            'merchant_income': [10.0] * 6,
+            'cost': [0.0] * 6,
+            'meter': [0.0] * 6,
+            'express_cost': [0.0] * 6,
+            'traffic_cost': [0.0] * 6,
+            'profit': [0.0] * 6,
+            'after_sale_status': [''] * 6,
+            'order_status': ['已发货'] * 6,
+            'platform': [0, 0, 2, 2, 2, 2],
+            'express_no': ['SF001', 'SF001', 'SN1', 'SN1', 'SN1', ''],
+            'parent_order_no': [None, None, 'DY1', 'DY1', 'DY1', None],
+            'postage': [0.0, 0.0, 5.0, 5.0, 5.0, 0.0],
+        })
+        df, matched, _ = _match_flowers_and_calc(order_df, {'花型A': 10.0})
+        assert matched == 6
+        by_no = df.set_index('order_no')
+        # 拼多多 A1/A2 同一快递单号 SF001 → 1 份，postage=0 → 固定 2.5，只记首行
+        assert by_no.loc['A1', '快递费'] == 2.5 and by_no.loc['A2', '快递费'] == 0
+        # 抖音 A3/A4/A5 同一主订单 DY1 → 1 份，postage=5.0 → 用实际值，只记首行
+        assert by_no.loc['A3', '快递费'] == 5.0
+        assert by_no.loc['A4', '快递费'] == 0 and by_no.loc['A5', '快递费'] == 0
+        # A6 抖音无主订单编号且无快递单号 → 回落 order_no，postage=0 → 2.5
+        assert by_no.loc['A6', '快递费'] == 2.5
+        assert df['快递费'].sum() == 10.0
+        # 发货包号：同包裹同行，A1/A2 同号，A3/A4/A5 同号，A6 单独
+        assert by_no.loc['A1', '发货包号'] == by_no.loc['A2', '发货包号']
+        assert by_no.loc['A3', '发货包号'] == by_no.loc['A4', '发货包号'] == by_no.loc['A5', '发货包号']
+        assert by_no.loc['A1', '发货包号'] != by_no.loc['A3', '发货包号']
+        assert by_no.loc['A6', '发货包号'] not in {
+            by_no.loc['A1', '发货包号'], by_no.loc['A3', '发货包号']}
