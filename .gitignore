@@ -15,6 +15,10 @@ alter_table_add_platform.sql
 migrate_platform.py
 fix_inventory_effect_date.py
 migrate_parent_order.py
+repair_double_deduct_snapshots.py
+repair_restore_730_anchors.py
+repair_rollback_artifacts.py
+sync_current_stock_20260802.py
 
 #.coverage相关
 .coverage

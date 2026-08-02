@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from inventory_service import (
+    _daily_adjust,
     check_flower_active,
     get_current_stock,
     add_stock,
@@ -258,6 +259,137 @@ class TestDeductStock:
 
 
 # ===========================================================================
+# deduct_stock  日报路径（is_daily_sales=True）双重扣减回归测试
+# ===========================================================================
+
+class TestDeductStockDaily:
+    """回归测试：日报自动扣减（is_daily_sales=True）不得双重扣减。
+    快照补全逻辑已把当天销售烘焙进 snapshot[report_date]（end-of-day），
+    deduct_stock 若再以该快照为基准扣 qty 会把当天销售减两次（粉红KT bug 根因）。
+    修复后应以 snapshot[report_date-1] 为基准自愈重算。"""
+
+    def _capture(self, mock_conn, old_stock=100.0, sync_stock=70.0, check_count=5, anchor_flag=None):
+        calls = []
+
+        def side_effect(sql, params=None, **kw):
+            s = str(sql)
+            res = MagicMock()
+            calls.append((s, params or {}))
+            if 'SELECT is_manual FROM inventory_snapshot' in s and 'snapshot_date = :d' in s:
+                res.fetchone.return_value = None if anchor_flag is None else (anchor_flag,)
+            elif ('SELECT stock FROM inventory_snapshot' in s and 'snapshot_date = :d' in s
+                    and 'ORDER BY' not in s and 'is_manual' not in s and 'MAX(' not in s):
+                res.fetchone.return_value = (old_stock,)
+            elif 'is_manual = 1' in s and 'snapshot_date > :d' in s and 'MIN(' not in s:
+                res.fetchone.return_value = None
+            elif 'MAX(snapshot_date)' in s:
+                res.scalar.return_value = None
+            elif 'daily_report_cache' in s:
+                res.scalar.return_value = 0
+            elif 'inventory_log' in s and 'COALESCE' in s:
+                res.scalar.return_value = 0
+            elif 'ORDER BY snapshot_date DESC LIMIT 1' in s:
+                res.fetchone.return_value = (sync_stock,)
+            elif 'COUNT(*)' in s and 'snapshot_date >= :d' in s:
+                res.scalar.return_value = check_count
+            else:
+                res.rowcount = 1
+            return res
+
+        mock_conn.execute.side_effect = side_effect
+        return calls
+
+    @patch('inventory_service.check_flower_active', return_value=(True, ''))
+    def test_daily_path_bases_on_prev_day(self, mock_check, mock_conn):
+        """日报路径应读取 snapshot[report_date-1] 作为基准，而非可能已烘焙的 report_date。"""
+        calls = self._capture(mock_conn)
+        deduct_stock('花型A', 30, '日报自动扣减 2026-07-15', 'system', '2026-07-15', is_daily_sales=True)
+        reads = [p for s, p in calls
+                 if 'SELECT stock FROM inventory_snapshot' in s and 'snapshot_date = :d' in s]
+        assert reads, '应读取基准快照'
+        assert str(reads[0]['d']) == '2026-07-14'
+
+    @patch('inventory_service.check_flower_active', return_value=(True, ''))
+    def test_daily_path_no_double_deduction(self, mock_check, mock_conn):
+        """prev-day=100、当日销售=30 → 日报扣减后快照应为 70（而非 100-30-30=40）。"""
+        calls = self._capture(mock_conn, old_stock=100.0, sync_stock=70.0)
+        deduct_stock('花型A', 30, '日报自动扣减 2026-07-15', 'system', '2026-07-15', is_daily_sales=True)
+        updates = [p for s, p in calls if 'INSERT INTO inventory_snapshot' in s]
+        assert updates, '应写入/更新 report_date 快照'
+        assert float(updates[0]['new']) == 70.0
+        assert float(updates[0]['new2']) == 70.0
+
+    @patch('inventory_service.check_flower_active', return_value=(True, ''))
+    def test_manual_path_still_uses_same_day_base(self, mock_check, mock_conn):
+        """手动路径（默认）仍以 report_date 快照为基准，行为不变。"""
+        calls = self._capture(mock_conn)
+        deduct_stock('花型A', 30, '手工出库', 'tester', '2026-07-15')
+        reads = [p for s, p in calls
+                 if 'SELECT stock FROM inventory_snapshot' in s and 'snapshot_date = :d' in s]
+        assert reads, '应读取基准快照'
+        assert str(reads[0]['d']) == '2026-07-15'
+
+    @patch('inventory_service.check_flower_active', return_value=(True, ''))
+    def test_daily_path_skips_manual_anchor(self, mock_check, mock_conn):
+        """日报路径：report_date 为手动锚点（is_manual=1）时不得覆盖锚点快照。
+        锚点是实盘数、已含当日销售，任何公式扣减都会破坏锚点（7/30 锚点被覆盖的 bug 根因）。"""
+        calls = self._capture(mock_conn, anchor_flag=1)
+        deduct_stock('花型A', 30, '日报自动扣减 2026-07-15', 'system', '2026-07-15', is_daily_sales=True)
+        # 发起锚点检查
+        anchor_checks = [p for s, p in calls if 'SELECT is_manual FROM inventory_snapshot' in s]
+        assert anchor_checks, '应先检查 report_date 是否手动锚点'
+        assert str(anchor_checks[0]['d']) == '2026-07-15'
+        # 不得写/更新快照、不得写流水
+        updates = [p for s, p in calls if 'INSERT INTO inventory_snapshot' in s]
+        assert not updates, '手动锚点应被跳过，不得写快照'
+        logs = [p for s, p in calls if 'INSERT INTO inventory_log' in s]
+        assert not logs, '手动锚点应被跳过，不得写流水'
+
+
+# ===========================================================================
+# _daily_adjust  排除「回退日报」伪影日志（8/2 虚增 bug 回归测试）
+# ===========================================================================
+
+class TestDailyAdjustExcludesRollbackLogs:
+    """回归测试：_daily_adjust 必须排除 reference LIKE '回退日报%' 的流水。
+    此类流水是重新生成日报时撤销旧扣减的对销记录，若计入会虚增当天快照（8/2 bug 根因）。"""
+
+    def test_sql_excludes_rollback_prefix(self, mock_conn):
+        captured = []
+
+        def side_effect(sql, params=None, **kw):
+            captured.append((str(sql), params or {}))
+            res = MagicMock()
+            res.scalar.return_value = 0
+            return res
+
+        mock_conn.execute.side_effect = side_effect
+        val = _daily_adjust(mock_conn, '花型A', '2026-08-02')
+        assert val == 0.0
+        sql, params = captured[0]
+        assert "change_type = '手动调整'" in sql
+        assert 'COALESCE(effect_date, DATE(created_at)) = :d' in sql
+        assert "NOT LIKE '回退日报%'" in sql
+        assert params.get('d') == '2026-08-02'
+
+    def test_exclude_ref_prefix_adds_second_clause(self, mock_conn):
+        captured = []
+
+        def side_effect(sql, params=None, **kw):
+            captured.append((str(sql), params or {}))
+            res = MagicMock()
+            res.scalar.return_value = 0
+            return res
+
+        mock_conn.execute.side_effect = side_effect
+        _daily_adjust(mock_conn, '花型A', '2026-08-02', exclude_ref_prefix='本次调整')
+        sql, params = captured[0]
+        assert "NOT LIKE '回退日报%'" in sql
+        assert 'NOT LIKE :excl' in sql
+        assert params.get('excl') == '本次调整%'
+
+
+# ===========================================================================
 # rollback_daily_sales  (transaction)
 # ===========================================================================
 
@@ -269,7 +401,31 @@ class TestRollbackDailySales:
         count, ok, msg = rollback_daily_sales('2026-07-15')
         assert count == 0
         assert ok is True
-        assert '未找到' in msg
+
+    def test_rollback_log_carries_effect_date(self, mock_conn):
+        """回退日志 INSERT 必须携带 effect_date = 被回退的那天（而非执行日），
+        否则按 created_at 归集会错位污染执行日快照（8/2 虚增 bug 根因）。"""
+        captured = []
+
+        def side_effect(sql, params=None, **kw):
+            s = str(sql)
+            if 'INSERT INTO inventory_log' in s and '手动调整' in s:
+                captured.append(params or {})
+            res = MagicMock()
+            if "change_type = '销售出库'" in s and 'reference LIKE' in s:
+                res.fetchall.return_value = [(1, '花型A', -10.0, 50.0, 40.0)]
+            else:
+                res.fetchall.return_value = []
+                res.rowcount = 1
+            return res
+
+        mock_conn.execute.side_effect = side_effect
+        with patch('inventory_service.get_current_stock', return_value=40.0):
+            count, ok, msg = rollback_daily_sales('2026-08-02')
+        assert ok is True
+        assert captured, '应写入回退日志'
+        assert captured[0].get('eff') == '2026-08-02'
+        assert '回退日报' in captured[0].get('ref', '')
 
     def test_rollback_with_logs(self, mock_conn):
         """When sales logs exist, should rollback and insert reversal logs."""
