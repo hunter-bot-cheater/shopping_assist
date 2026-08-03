@@ -133,7 +133,7 @@ if menu == "🏠 首页":
 
 elif menu == "📤 导入订单":
     st.header("📤 导入订单 Excel")
-    st.info("💡 上传拼多多/淘宝导出的订单明细 Excel 文件，系统会自动识别平台并清洗导入")
+    st.info("💡 上传拼多多/淘宝/抖音导出的订单明细 Excel 文件，系统会自动识别平台并清洗导入")
 
     # 文件上传
     uploaded_file = st.file_uploader(
