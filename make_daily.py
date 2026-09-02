@@ -33,6 +33,18 @@ def ensure_output_dir():
         os.makedirs(OUTPUT_DIR)
 
 
+def get_range_output_dir():
+    """区间报告输出目录：优先读 config.py 的 OUTPUT_DIR_range_report（每台机器可单独配置，
+    如远程 G:/shopping_assist/区间报告）；未配置或值不是有效字符串时与日报同目录，保持原有行为。"""
+    try:
+        from config import OUTPUT_DIR_range_report
+        if isinstance(OUTPUT_DIR_range_report, str) and OUTPUT_DIR_range_report.strip():
+            return OUTPUT_DIR_range_report
+    except (ImportError, AttributeError):
+        pass
+    return OUTPUT_DIR
+
+
 def extract_meter_from_spec(spec):
     """提取购买米数（只识别逗号前的长度，避免把宽幅识别进去）"""
     if pd.isna(spec):
@@ -988,7 +1000,10 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
     仅排除退款订单与已取消/已关闭订单。
     文件名：区间报告_YYYYMMDD-YYYYMMDD.xlsx
     """
-    ensure_output_dir()
+    # 区间报告输出目录（可在每台机器 config.py 单独配置）
+    _range_dir = get_range_output_dir()
+    if not os.path.exists(_range_dir):
+        os.makedirs(_range_dir)
 
     try:
         start_dt = datetime.strptime(start_date, '%Y-%m-%d')
@@ -1004,11 +1019,7 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
     start_date = start_dt.strftime('%Y-%m-%d')
     end_date = end_dt.strftime('%Y-%m-%d')
     filename = f"区间报告_{start_dt.strftime('%Y%m%d')}-{end_dt.strftime('%Y%m%d')}.xlsx"
-    filepath = os.path.join(OUTPUT_DIR, filename)
-
-    if os.path.exists(filepath) and not force:
-        print(f"⏭️ {filename} 已存在，跳过生成")
-        return filepath
+    filepath = os.path.join(_range_dir, filename)
 
     # ============================================================
     # 读取区间订单（按下单日期统计：拼多多订单号前6位 / 淘宝订单付款时间 / 抖音订单完成时间）
