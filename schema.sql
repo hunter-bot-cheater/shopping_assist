@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS data2026 (
     express_no VARCHAR(50),
     express_company VARCHAR(50),
     order_time DATETIME,
+    payment_time DATETIME NULL COMMENT '订单付款时间/支付完成时间（淘宝/抖音下单日期口径，导出列「订单付款时间」「支付完成时间」）',
     installment VARCHAR(10),
     installment_periods INT,
     fee_bearer VARCHAR(20),
