@@ -342,7 +342,18 @@ def _match_flowers_and_calc(df, cost_map):
     # ============================================================
     # 退款标记
     # ============================================================
-    df['是否退款'] = df['after_sale_status'].astype(str).str.contains('退款成功', na=False)
+    # 退款标记：售后状态 或 订单状态 含「退款成功」都算退款
+    # （拼多多退款标记在订单状态如「已发货，退款成功」+ 售后状态「退款成功」；
+    #   淘宝/抖音退款标记合成在售后状态如「已发货，退款成功」，订单状态为「交易关闭/已关闭」）
+    df['是否退款'] = (
+        df['after_sale_status'].astype(str).str.contains('退款成功', na=False)
+        | df['order_status'].astype(str).str.contains('退款成功', na=False)
+    )
+    # 已发货/已收货 且 退款成功（对账明细保留，涉及运费承担）；已发货/已收货标记可能在任一字段
+    df['发货退款'] = df['是否退款'] & (
+        df['order_status'].astype(str).str.contains('已发货|已收货', na=False, regex=True)
+        | df['after_sale_status'].astype(str).str.contains('已发货|已收货', na=False, regex=True)
+    )
 
     return df, matched_count, unmatched_count
 
@@ -679,20 +690,12 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
 
     # ============================================================
     # 明细表数据：正常订单 + 已发货/已收货退款订单（用于对账/运费核算）
+    # 已发货/已收货退款标记可能在订单状态或售后状态任一字段（淘宝/抖音合成在售后状态，
+    # 订单状态为「交易关闭/已关闭」），用统一的「发货退款」标记判断，避免漏掉
     # ============================================================
-    # 需要保留的退款状态（涉及运费承担）
-    keep_refund_statuses = [
-        '已发货，退款成功',
-        '已收货，退款成功'
-    ]
-
-    # 明细表数据：正常订单 + 符合条件的退款订单
     detail_df = df[
-        (~df['order_status'].isin(CANCELLED_STATUSES)) &
-        (
-                (~df['是否退款']) |
-                (df['order_status'].isin(keep_refund_statuses))
-        )
+        ((~df['order_status'].isin(CANCELLED_STATUSES)) & (~df['是否退款']))
+        | df['发货退款']
         ].copy()
 
     # 退款订单的成本和米数设为 0
@@ -1072,16 +1075,10 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
     # ============================================================
     normal_df = df[(~df['是否退款']) & (~df['order_status'].isin(CANCELLED_STATUSES))]
 
-    keep_refund_statuses = [
-        '已发货，退款成功',
-        '已收货，退款成功'
-    ]
+    # 明细：正常订单 + 已发货/已收货退款订单（发货退款标记在订单状态或售后状态任一字段）
     detail_df = df[
-        (~df['order_status'].isin(CANCELLED_STATUSES)) &
-        (
-                (~df['是否退款']) |
-                (df['order_status'].isin(keep_refund_statuses))
-        )
+        ((~df['order_status'].isin(CANCELLED_STATUSES)) & (~df['是否退款']))
+        | df['发货退款']
         ].copy()
     detail_df.loc[detail_df['是否退款'] == True, ['成本', '米数']] = 0
 

@@ -21,6 +21,7 @@ from add_del_flower import (
 import time
 from sqlalchemy import text
 from mysql_conn import engine
+from report_date_logic import ORDER_DATE_SQL
 # ============================
 # 辅助函数：获取花型列表（供下拉选择用）
 # ============================
@@ -350,7 +351,7 @@ elif menu == "📥 入库登记":
             )
             qty = st.number_input("入库米数 *", min_value=0.5, step=0.5, format="%.1f")
         with col2:
-            stock_date = st.date_input("入库日期", value=date.today(), help="入库生效日期，该日期及之后的库存都会增加")
+            stock_date = st.date_input("入库日期", value=date.today(), key="stock_date_key", help="入库生效日期，该日期及之后的库存都会增加")
             ref = st.text_input("备注", placeholder="例：2026-07-25 第一批进货")
             operator = st.text_input("操作人", value="admin")
 
@@ -402,7 +403,7 @@ elif menu == "📤 出库登记":
             )
             qty = st.number_input("出库米数 *", min_value=0.5, step=0.5, format="%.1f")
         with col2:
-            ref_date = st.date_input("销售日期", value=date.today(), help="出库日期，该日期及之后的库存都会减少")
+            ref_date = st.date_input("销售日期", value=date.today(), key="ref_date_key", help="出库日期，该日期及之后的库存都会减少")
             operator = st.text_input("操作人", value="admin")
 
         submitted = st.form_submit_button("✅ 确认出库")
@@ -676,7 +677,7 @@ elif menu == "📊 报告生成":
     st.subheader("📝 生成日报")
     st.info("💡 每次生成都会强制覆盖已有日报，先回退旧库存，再基于最新订单数据重新扣减")
 
-    gen_date = st.date_input("选择日期", value=date.today())
+    gen_date = st.date_input("选择日期", value=date.today(), key="gen_date_key")
     gen_btn = st.button("🚀 生成日报", type="primary")
     if gen_btn:
         from make_daily import generate_daily_report
@@ -708,9 +709,9 @@ elif menu == "📊 报告生成":
 
     col1, col2 = st.columns(2)
     with col1:
-        range_start = st.date_input("开始日期", value=date(2026, 7, 1))
+        range_start = st.date_input("开始日期", value=date.today() - timedelta(days=30), key="range_start_date")
     with col2:
-        range_end = st.date_input("结束日期", value=date.today())
+        range_end = st.date_input("结束日期", value=date.today(), key="range_end_date")
 
     if st.button("🚀 生成区间报告", type="primary"):
         from make_daily import generate_range_report
@@ -839,7 +840,7 @@ elif menu == "⚙️ 库存调整":
     st.markdown("---")
 elif menu == "📊 退款明细":
     st.header("📊 退款明细表")
-    st.info("💡 显示已发货/已收货且退款成功的订单明细（按退款时间倒序）")
+    st.info("💡 显示已发货/已收货且退款成功的订单明细（按下单日期倒序；系统暂无真实退款时间，日期列如实为下单日期）")
 
     # 同步按钮：清洗并刷新退款明细
     if st.button("🔄 同步并清洗退款明细", key="sync_refund_btn"):
@@ -862,9 +863,9 @@ elif menu == "📊 退款明细":
         # 日期筛选器
         col1, col2, col3 = st.columns([2, 2, 1])
         with col1:
-            start_date = st.date_input("开始日期", value=date(2026, 7, 1))
+            start_date = st.date_input("开始日期", value=date.today() - timedelta(days=30), key="refund_start_date")
         with col2:
-            end_date = st.date_input("结束日期", value=date.today())
+            end_date = st.date_input("结束日期", value=date.today(), key="refund_end_date")
         with col3:
             selected_flower = st.selectbox("花型筛选", options=flower_list, index=0)
 
@@ -885,7 +886,7 @@ elif menu == "📊 退款明细":
                     refund_meters AS '退款米数',
                     refund_amount AS '退款金额',
                     after_sale_status AS '售后状态',
-                    refund_time AS '退款时间'
+                    refund_time AS '下单日期'
                 FROM refund_detail
                 WHERE {where_clause}
                 ORDER BY refund_time DESC
@@ -894,13 +895,16 @@ elif menu == "📊 退款明细":
         df = pd.read_sql(query, conn, params=params)
 
         # 🔧 查询总营业额（排除所有退款和取消订单）
-        total_revenue_query = text("""
-                SELECT SUM(merchant_income) 
-                FROM data2026 
-                WHERE DATE(delivery_time) >= :start 
-                  AND DATE(delivery_time) <= :end
-                  AND order_status != '已取消'
-                  AND after_sale_status NOT LIKE '%退款成功%'
+        # 总营业额口径与日报一致：按下单日期统计，排除所有退款（售后/订单任一字段）与已取消/已关闭/交易关闭
+        total_revenue_query = text(f"""
+                SELECT SUM(merchant_income) FROM (
+                    SELECT merchant_income, order_status, after_sale_status, {ORDER_DATE_SQL} AS order_date
+                    FROM data2026
+                ) t
+                WHERE t.order_date >= :start
+                  AND t.order_date <= :end
+                  AND NOT (t.after_sale_status LIKE '%退款成功%' OR t.order_status LIKE '%退款成功%')
+                  AND t.order_status NOT IN ('已取消', '已关闭', '交易关闭')
             """)
         total_revenue = conn.execute(
             total_revenue_query,
@@ -1137,7 +1141,8 @@ elif menu == "⚙️ 系统设置":
         new_start_date = st.date_input(
             "选择新的起始日期",
             value=current_start_date,
-            max_value=datetime.now().date()
+            max_value=datetime.now().date(),
+            key="sys_start_date_key"
         )
     with col2:
         st.write("")

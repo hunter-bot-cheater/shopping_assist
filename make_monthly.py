@@ -1018,28 +1018,10 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
     # ==========================================================
 
 
-    df['是否退款']=df['after_sale_status'].apply(
-
-        lambda x:
-
-        True
-
-        if str(x)
-
-        in
-
-        [
-
-            '退款成功',
-
-            '已发货，退款成功',
-
-            '未发货，退款成功'
-
-        ]
-
-        else False
-
+    # 退款标记（与日报口径一致）：售后状态 或 订单状态 含「退款成功」都算退款
+    df['是否退款']=(
+        df['after_sale_status'].astype(str).str.contains('退款成功', na=False)
+        | df['order_status'].astype(str).str.contains('退款成功', na=False)
     )
 
 

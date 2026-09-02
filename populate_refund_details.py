@@ -56,16 +56,19 @@ def sync_refund_details(cost_map=None):
     print("📋 正在同步退款明细...")
 
     with engine.connect() as conn:
-        # ① 先清理历史脏数据：refund_detail 里现存但源订单不满足「已发货/已收货 退款成功」的记录
-        # 依据：以 data2026 当前状态为准，反查 order_no+flower+spec 不再符合条件的退款明细
+        # ① 先清理：① 订单表中已不存在该订单的残留 ② 现存但源订单不再满足「已发货/已收货 退款成功」的记录
+        # 依据：以 data2026 当前状态为准；已发货/已收货标记可能在订单状态或售后状态任一字段
+        #（淘宝/抖音合成在售后状态如「已发货，退款成功」，订单状态为「交易关闭/已关闭」）
         cleanup = conn.execute(text("""
             DELETE r FROM refund_detail r
-            INNER JOIN data2026 d ON r.order_no = d.order_no
-            WHERE NOT (
-                (d.order_status LIKE '%已发货%' OR d.order_status LIKE '%已收货%')
-                AND d.after_sale_status LIKE '%退款成功%'
-                AND d.after_sale_status NOT LIKE '%未发货%'
-            )
+            LEFT JOIN data2026 d ON r.order_no = d.order_no
+            WHERE d.order_no IS NULL
+               OR NOT (
+                    (d.order_status LIKE '%已发货%' OR d.order_status LIKE '%已收货%'
+                     OR d.after_sale_status LIKE '%已发货%' OR d.after_sale_status LIKE '%已收货%')
+                    AND d.after_sale_status LIKE '%退款成功%'
+                    AND d.after_sale_status NOT LIKE '%未发货%'
+               )
         """))
         cleaned = cleanup.rowcount or 0
         if cleaned:
@@ -89,7 +92,8 @@ def sync_refund_details(cost_map=None):
                     after_sale_status,
                     order_time
                 FROM data2026
-                WHERE (order_status LIKE '%已发货%' OR order_status LIKE '%已收货%')
+                WHERE (order_status LIKE '%已发货%' OR order_status LIKE '%已收货%'
+                       OR after_sale_status LIKE '%已发货%' OR after_sale_status LIKE '%已收货%')
                   AND after_sale_status LIKE '%退款成功%'
                   AND after_sale_status NOT LIKE '%未发货%'
             """),
