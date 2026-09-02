@@ -21,6 +21,7 @@ class TestSyncRefundDetails:
             'product_quantity': [1],
             'merchant_income': [50.0],
             'after_sale_status': ['已发货，退款成功'],
+            'order_status': ['已发货'],
             'order_time': [pd.Timestamp('2026-07-15 10:00:00')],
         })
 
@@ -51,6 +52,7 @@ class TestSyncRefundDetails:
             'product_quantity': [1],
             'merchant_income': [50.0],
             'after_sale_status': ['已发货，退款成功'],
+            'order_status': ['已发货'],
             'order_time': [pd.Timestamp('2026-07-15 10:00:00')],
         })
         mock_conn.execute.return_value.rowcount = 1

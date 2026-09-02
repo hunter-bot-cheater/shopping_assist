@@ -196,7 +196,7 @@ class TestImportExcelFromDataFrame:
 
     @patch('import_order.engine')
     def test_affected_dates_from_changed_orders(self, mock_engine, mock_conn):
-        """成功导入后应返回变化订单的发货日期（去重、排序、格式化为 %Y-%m-%d）。"""
+        """成功导入后应返回变化订单的下单日期（去重、排序、格式化为 %Y-%m-%d）。"""
         from datetime import date
 
         df = pd.DataFrame({
@@ -216,8 +216,8 @@ class TestImportExcelFromDataFrame:
         def connect_execute(sql, params=None, **kw):
             s = str(sql)
             result = MagicMock()
-            # 受影响日期查询（变化订单的发货日期）；其余查询（旧数据对比等）返回空
-            if 'delivery_time' in s and 'order_no IN' in s:
+            # 受影响日期查询（变化订单的下单日期）；其余查询（旧数据对比等）返回空
+            if 'order_date' in s and 'order_no IN' in s:
                 result.fetchall.return_value = [(date(2026, 7, 1),), (date(2026, 7, 2),)]
             else:
                 result.fetchall.return_value = []

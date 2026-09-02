@@ -12,6 +12,7 @@ from mysql_conn import engine
 
 from import_order import orders, PLATFORM_NAMES
 from make_daily import build_platform_summary, build_platform_totals, write_summary_sheet, _auto_width_sheets, CANCELLED_STATUSES, FLOWER_ALIAS_MAP
+from report_date_logic import ORDER_DATE_SQL
 # ==========================================================
 # 配置
 # ==========================================================
@@ -393,58 +394,26 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
     # ======================================================
 
 
+    # 按下单日期统计：拼多多订单号前6位 / 淘宝支付单号前8位 / 抖音订单完成时间
     sql=text(f"""
-
         SELECT
-
-            id,
-
-            order_no,
-
-            product,
-
-            product_spec,
-
-            product_quantity,
-
-            merchant_income,
-
-            cost,
-
-            meter,
-
-            express_cost,
-
-            traffic_cost,
-
-            profit,
-
-            after_sale_status,
-
-            order_status,
-
-            platform,
-
+            id, order_no, product, product_spec,
+            product_quantity, merchant_income,
+            cost, meter, express_cost, traffic_cost, profit,
+            after_sale_status, order_status, platform,
             delivery_time
-
-
-        FROM {orders}
-
-
-        WHERE delivery_time >= :start_date
-
-
-        AND delivery_time <
-
-        DATE_ADD(
-
-            :end_date,
-
-            INTERVAL 1 DAY
-
-        )
-
-
+        FROM (
+            SELECT
+                id, order_no, product, product_spec,
+                product_quantity, merchant_income,
+                cost, meter, express_cost, traffic_cost, profit,
+                after_sale_status, order_status, platform,
+                delivery_time,
+                {ORDER_DATE_SQL} AS order_date
+            FROM {orders}
+        ) t
+        WHERE t.order_date >= :start_date
+          AND t.order_date < DATE_ADD(:end_date, INTERVAL 1 DAY)
     """)
 
 

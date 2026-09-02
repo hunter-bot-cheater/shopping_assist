@@ -155,6 +155,7 @@ class TestPlatformGrouping:
             'after_sale_status': ['', ''],
             'order_status': ['已发货', '已发货'],
             'platform': [0, 1],  # 拼多多 + 淘宝
+            'order_date': pd.to_datetime(['2026-07-15', '2026-07-15']),
         })
 
         with patch('make_daily.OUTPUT_DIR', str(tmp_path)), \
@@ -298,6 +299,7 @@ class TestGenerateRangeReport:
             'after_sale_status': ['', ''],
             'order_status': ['已发货', '已发货'],
             'platform': [0, 1],  # 拼多多 + 淘宝
+            'order_date': pd.to_datetime(['2026-07-15', '2026-07-15']),
         })
 
         with patch('make_daily.OUTPUT_DIR', str(tmp_path)), \
@@ -340,6 +342,7 @@ class TestGenerateRangeReport:
             'express_no': ['EX001', 'EX001', 'EX002'],
             'postage': [0.0, 0.0, 0.0],
             'parent_order_no': [None, None, None],
+            'order_date': pd.to_datetime(['2026-07-01', '2026-07-01', '2026-07-02']),
         })
 
         with patch('make_daily.OUTPUT_DIR', str(tmp_path)), \
@@ -376,6 +379,7 @@ class TestGenerateRangeReport:
             'after_sale_status': ['', ''],
             'order_status': ['已发货', '已发货'],
             'platform': [0, 1],  # 拼多多 + 淘宝（merchant_income=0）
+            'order_date': pd.to_datetime(['2026-07-01', '2026-07-01']),
         })
 
         with patch('make_daily.OUTPUT_DIR', str(tmp_path)), \

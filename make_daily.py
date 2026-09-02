@@ -7,6 +7,7 @@ from sqlalchemy import text
 from mysql_conn import engine
 from import_order import orders, PLATFORM_NAMES, PLATFORM_DOUYIN, extract_flower_from_spec
 from inventory_service import deduct_stock, get_missing_report_dates
+from report_date_logic import ORDER_DATE_SQL
 
 # ============================
 # 配置
@@ -20,8 +21,8 @@ SUMMARY_METRICS = ['订单数', '成本', '米数', '营业额', '快递费', '�
 SUMMARY_PLATFORMS = ('拼多多', '淘宝', '抖音')
 # 平台汇总表始终展示的平台（无数据补 0）
 PLATFORM_SUMMARY_NAMES = ('拼多多', '淘宝', '抖音')
-# 已取消/已关闭的订单状态（拼多多=已取消，抖音=已关闭；淘宝=交易关闭单独处理）
-CANCELLED_STATUSES = ('已取消', '已关闭')
+# 已取消/已关闭的订单状态（拼多多=已取消，抖音=已关闭；淘宝=交易关闭——未付款关闭单不计入，避免虚增营业额）
+CANCELLED_STATUSES = ('已取消', '已关闭', '交易关闭')
 
 
 # ============================
@@ -610,7 +611,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
         print(f"✅ 已清理 {target_date} 的所有旧缓存数据")
 
     # ============================================================
-    # 读取当天订单
+    # 读取当天订单（按下单日期统计：拼多多订单号前6位 / 淘宝订单付款时间 / 抖音订单完成时间）
     # ============================================================
     query = text(f"""
         SELECT
@@ -618,10 +619,18 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
             product_quantity, merchant_income,
             cost, meter, express_cost, traffic_cost, profit,
             after_sale_status, order_status, platform,
-            express_no, postage, parent_order_no
-        FROM {orders}
-        WHERE DATE(delivery_time) = :target_date
-          AND delivery_time IS NOT NULL
+            express_no, postage, parent_order_no, order_date
+        FROM (
+            SELECT
+                id, order_no, product, product_spec,
+                product_quantity, merchant_income,
+                cost, meter, express_cost, traffic_cost, profit,
+                after_sale_status, order_status, platform,
+                express_no, postage, parent_order_no,
+                {ORDER_DATE_SQL} AS order_date
+            FROM {orders}
+        ) t
+        WHERE t.order_date = :target_date
     """)
 
     try:
@@ -681,13 +690,14 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # 明细表
     # ============================================================
     detail_cols = ['花型', '平台', '发货包号', '成本', '米数', 'merchant_income', '快递费', '盈利',
-                   'after_sale_status', 'order_no', 'product_spec', 'product_quantity', '是否退款']
+                   'after_sale_status', 'order_no', 'order_date', 'product_spec', 'product_quantity', '是否退款']
     detail = detail_df[detail_cols].copy()
     detail = detail.rename(columns={
         'merchant_income': '营业额',
         'after_sale_status': '售后状态',
         'product_spec': '商品规格',
-        'product_quantity': '商品数量'
+        'product_quantity': '商品数量',
+        'order_date': '成交日期'
     })
     detail = detail.sort_values('花型')
 
@@ -779,97 +789,109 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
 
     # ============================================================
     # 🔧 回退旧扣减 + 重新扣减库存（不依赖 inventory_log）
+    # 关键改动：回退与重扣置于同一事务，整体提交或整体回滚。
+    # 避免「回退已提交、重扣中途失败」导致部分花型库存虚高。
+    # 仅当 old_data 存在（需回退）或 normal_df 非空（需扣减）时才开事务。
     # ============================================================
-    # 第 1 步：根据旧缓存数据回退上一次日报的扣减
-    if old_data:
+    need_txn = bool(old_data) or (not normal_df.empty)
+    if need_txn:
         rollback_count = 0
+        deducted_count = 0
         with engine.connect() as conn:
             trans = conn.begin()
-            for flower, data in old_data.items():
-                prev_meters = float(data.get('total_meters', 0))
-                if prev_meters <= 0.001:
-                    continue
-                # 读回退前快照值
-                before_row = conn.execute(
-                    text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
-                    {"f": flower, "d": target_date}
-                ).fetchone()
-                before_stock = float(before_row[0]) if before_row else 0
-
-                # 若 target_date 为手动锚点（is_manual=1），锚点是实盘数、已含当日销售，
-                # 日报扣减本来就跳过它（deduct_stock is_daily_sales 路径），无需回退。
-                anchor_flag = conn.execute(
-                    text("SELECT is_manual FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
-                    {"f": flower, "d": target_date}
-                ).fetchone()
-                if anchor_flag is not None and anchor_flag[0]:
-                    print(f"  ⏭️ {flower} {target_date} 为手动锚点，跳过回退")
-                    continue
-
-                # 回退实时库存
-                conn.execute(
-                    text("UPDATE inventory SET current_stock = current_stock + :qty WHERE flower = :f"),
-                    {"qty": prev_meters, "f": flower}
-                )
-                # 回退快照（从 target_date 起所有快照 +prev_meters，不碰手动锚点）
-                conn.execute(
-                    text("""
-                        UPDATE inventory_snapshot
-                        SET stock = stock + :qty, updated_by = 'system', updated_at = CURRENT_TIMESTAMP
-                        WHERE flower = :f AND snapshot_date >= :d AND is_manual = 0
-                    """),
-                    {"qty": prev_meters, "f": flower, "d": target_date}
-                )
-                # 写入回退日志（effect_date 归集到被回退的那天，避免错位污染执行日）
-                conn.execute(
-                    text("""
-                        INSERT INTO inventory_log
-                        (flower, change_type, change_qty, before_stock, after_stock, reference, operator, effect_date)
-                        VALUES (:f, '手动调整', :qty, :before, :after, :ref, :op, :eff)
-                    """),
-                    {
-                        "f": flower, "qty": prev_meters,
-                        "before": before_stock,
-                        "after": before_stock + prev_meters,
-                        "ref": f"回退日报 {target_date}（重新生成）",
-                        "op": "system",
-                        "eff": target_date
-                    }
-                )
-                rollback_count += 1
-            trans.commit()
-        if rollback_count > 0:
-            print(f"🔄 已回退 {rollback_count} 个花型的旧扣减")
-
-    # 第 2 步：按新日报重新扣减
-    if not normal_df.empty:
-        sales_summary = normal_df.groupby('花型')['米数'].sum().reset_index()
-        print("\n📦 正在扣减库存...")
-        deducted_count = 0
-        for _, row in sales_summary.iterrows():
-            flower = row['花型']
-            current_meters = float(row['米数'])
-            if current_meters <= 0.001:
-                continue
             try:
-                deduct_stock(
-                    flower=flower,
-                    qty=current_meters,
-                    reference=f"日报自动扣减 {target_date}",
-                    operator="system",
-                    report_date=target_date,
-                    is_daily_sales=True
-                )
-                deducted_count += 1
-                print(f"  ✅ {flower}: 扣减 {current_meters:.1f} 米")
-            except ValueError as e:
-                print(f"  ⚠️ {e}，跳过该花型")
+                # 第 1 步：根据旧缓存数据回退上一次日报的扣减
+                if old_data:
+                    for flower, data in old_data.items():
+                        prev_meters = float(data.get('total_meters', 0))
+                        if prev_meters <= 0.001:
+                            continue
+                        # 读回退前快照值
+                        before_row = conn.execute(
+                            text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+                            {"f": flower, "d": target_date}
+                        ).fetchone()
+                        before_stock = float(before_row[0]) if before_row else 0
 
-        if deducted_count > 0:
-            print(f"✅ 库存扣减完成：{deducted_count} 个花型")
-        else:
-            print("ℹ️ 没有需要扣减的花型")
-    elif not old_data:
+                        # 若 target_date 为手动锚点（is_manual=1），锚点是实盘数、已含当日销售，
+                        # 日报扣减本来就跳过它（deduct_stock is_daily_sales 路径），无需回退。
+                        anchor_flag = conn.execute(
+                            text("SELECT is_manual FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+                            {"f": flower, "d": target_date}
+                        ).fetchone()
+                        if anchor_flag is not None and anchor_flag[0]:
+                            print(f"  ⏭️ {flower} {target_date} 为手动锚点，跳过回退")
+                            continue
+
+                        # 回退实时库存
+                        conn.execute(
+                            text("UPDATE inventory SET current_stock = current_stock + :qty WHERE flower = :f"),
+                            {"qty": prev_meters, "f": flower}
+                        )
+                        # 回退快照（从 target_date 起所有快照 +prev_meters，不碰手动锚点）
+                        conn.execute(
+                            text("""
+                                UPDATE inventory_snapshot
+                                SET stock = stock + :qty, updated_by = 'system', updated_at = CURRENT_TIMESTAMP
+                                WHERE flower = :f AND snapshot_date >= :d AND is_manual = 0
+                            """),
+                            {"qty": prev_meters, "f": flower, "d": target_date}
+                        )
+                        # 写入回退日志（effect_date 归集到被回退的那天，避免错位污染执行日）
+                        conn.execute(
+                            text("""
+                                INSERT INTO inventory_log
+                                (flower, change_type, change_qty, before_stock, after_stock, reference, operator, effect_date)
+                                VALUES (:f, '手动调整', :qty, :before, :after, :ref, :op, :eff)
+                            """),
+                            {
+                                "f": flower, "qty": prev_meters,
+                                "before": before_stock,
+                                "after": before_stock + prev_meters,
+                                "ref": f"回退日报 {target_date}（重新生成）",
+                                "op": "system",
+                                "eff": target_date
+                            }
+                        )
+                        rollback_count += 1
+
+                # 第 2 步：按新日报重新扣减（复用同一事务连接）
+                if not normal_df.empty:
+                    sales_summary = normal_df.groupby('花型')['米数'].sum().reset_index()
+                    print("\n📦 正在扣减库存...")
+                    for _, row in sales_summary.iterrows():
+                        flower = row['花型']
+                        current_meters = float(row['米数'])
+                        if current_meters <= 0.001:
+                            continue
+                        try:
+                            deduct_stock(
+                                flower=flower,
+                                qty=current_meters,
+                                reference=f"日报自动扣减 {target_date}",
+                                operator="system",
+                                report_date=target_date,
+                                is_daily_sales=True,
+                                conn=conn
+                            )
+                            deducted_count += 1
+                            print(f"  ✅ {flower}: 扣减 {current_meters:.1f} 米")
+                        except ValueError as e:
+                            print(f"  ⚠️ {e}，跳过该花型")
+
+                # 全部成功才提交；任一步异常都整体回滚
+                trans.commit()
+                if rollback_count > 0:
+                    print(f"🔄 已回退 {rollback_count} 个花型的旧扣减")
+                if deducted_count > 0:
+                    print(f"✅ 库存扣减完成：{deducted_count} 个花型")
+                elif rollback_count == 0:
+                    print("ℹ️ 没有需要扣减的花型")
+            except Exception as e:
+                trans.rollback()
+                print(f"❌ 库存回退/扣减事务失败，已整体回滚：{e}")
+                raise
+    else:
         print("ℹ️ 无旧数据且无新订单，无需库存变动")
 
     # ============================================================
@@ -989,7 +1011,7 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
         return filepath
 
     # ============================================================
-    # 读取区间订单
+    # 读取区间订单（按下单日期统计：拼多多订单号前6位 / 淘宝订单付款时间 / 抖音订单完成时间）
     # ============================================================
     query = text(f"""
         SELECT
@@ -997,11 +1019,19 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
             product_quantity, merchant_income,
             cost, meter, express_cost, traffic_cost, profit,
             after_sale_status, order_status, platform,
-            express_no, postage, parent_order_no
-        FROM {orders}
-        WHERE delivery_time >= :start_date
-          AND delivery_time < DATE_ADD(:end_date, INTERVAL 1 DAY)
-          AND delivery_time IS NOT NULL
+            express_no, postage, parent_order_no, order_date
+        FROM (
+            SELECT
+                id, order_no, product, product_spec,
+                product_quantity, merchant_income,
+                cost, meter, express_cost, traffic_cost, profit,
+                after_sale_status, order_status, platform,
+                express_no, postage, parent_order_no,
+                {ORDER_DATE_SQL} AS order_date
+            FROM {orders}
+        ) t
+        WHERE t.order_date >= :start_date
+          AND t.order_date < DATE_ADD(:end_date, INTERVAL 1 DAY)
     """)
     try:
         with engine.connect() as conn:
@@ -1046,13 +1076,14 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
 
     # 明细表
     detail_cols = ['花型', '平台', '发货包号', '成本', '米数', 'merchant_income', '快递费', '盈利',
-                   'after_sale_status', 'order_no', 'product_spec', 'product_quantity', '是否退款']
+                   'after_sale_status', 'order_no', 'order_date', 'product_spec', 'product_quantity', '是否退款']
     detail = detail_df[detail_cols].copy()
     detail = detail.rename(columns={
         'merchant_income': '营业额',
         'after_sale_status': '售后状态',
         'product_spec': '商品规格',
-        'product_quantity': '商品数量'
+        'product_quantity': '商品数量',
+        'order_date': '成交日期'
     })
     detail = detail.sort_values('花型')
 
@@ -1085,9 +1116,12 @@ def generate_all_missing_reports(orders=orders):
     ensure_output_dir()
     # 1. 获取所有有订单的日期（按 delivery_time）
     query_order_dates = text(f"""
-        SELECT DISTINCT DATE(delivery_time) AS order_date
-        FROM {orders}
-        WHERE delivery_time IS NOT NULL
+        SELECT DISTINCT order_date
+        FROM (
+            SELECT {ORDER_DATE_SQL} AS order_date
+            FROM {orders}
+        ) t
+        WHERE order_date IS NOT NULL
         ORDER BY order_date
     """)
     # 2. 获取已有日报缓存的日期
