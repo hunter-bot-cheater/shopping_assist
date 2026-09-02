@@ -840,18 +840,38 @@ elif menu == "⚙️ 库存调整":
     st.markdown("---")
 elif menu == "📊 退款明细":
     st.header("📊 退款明细表")
-    st.info("💡 显示已发货/已收货且退款成功的订单明细（按下单日期倒序；系统暂无真实退款时间，日期列如实为下单日期）")
+    st.info("💡 只显示/统计「已发货/已收货 退款成功」的订单明细（未发货退款成功不入明细；按下单日期倒序，日期列如实为下单日期）")
 
-    # 同步按钮：清洗并刷新退款明细
+    # 同步按钮：从数据库实时同步，展示详细结果与逐单错误
     if st.button("🔄 同步并清洗退款明细", key="sync_refund_btn"):
-        with st.spinner("正在同步并清理历史脏数据..."):
+        with st.spinner("正在从数据库同步退款明细..."):
             try:
                 from populate_refund_details import sync_refund_details
-                sync_refund_details()
-                st.success("✅ 退款明细同步完成")
-                st.rerun()
+                result = sync_refund_details()
+                st.session_state['refund_sync_result'] = result
+                st.session_state.pop('refund_sync_error', None)
             except Exception as e:
-                st.error(f"❌ 同步失败：{e}")
+                st.session_state['refund_sync_result'] = None
+                st.session_state['refund_sync_error'] = str(e)
+        st.rerun()
+
+    # 展示最近一次同步的详细结果（含逐单错误）
+    _sync_res = st.session_state.get('refund_sync_result')
+    if _sync_res:
+        _errs = _sync_res.get('errors') or []
+        st.success(
+            f"✅ 同步完成：清洗 {_sync_res.get('cleaned', 0)} 条 | "
+            f"重写 {_sync_res.get('backfilled', 0)} 条 | "
+            f"未发货退款排除 {_sync_res.get('excluded_undelivered', 0)} 条 | "
+            f"找到已发货/已收货退款 {_sync_res.get('found', 0)} 条 → 写入 {_sync_res.get('synced', 0)} 条"
+        )
+        if _errs:
+            with st.expander(f"⚠️ {len(_errs)} 条订单同步出错（已跳过该条，其余正常写入）"):
+                st.code("\n".join(f"{o}: {m}" for o, m in _errs[:30]))
+        else:
+            st.caption("✅ 逐单写入无错误")
+    if st.session_state.get('refund_sync_error'):
+        st.error(f"❌ 同步失败：{st.session_state['refund_sync_error']}")
     # 查询退款明细
     with engine.connect() as conn:
         # 获取所有花型（用于筛选）
@@ -869,8 +889,13 @@ elif menu == "📊 退款明细":
         with col3:
             selected_flower = st.selectbox("花型筛选", options=flower_list, index=0)
 
-        # 构建查询条件
-        conditions = ["refund_time >= :start", "refund_time <= :end"]
+        # 构建查询条件：只显示/统计「已发货/已收货 退款成功」，未发货退款成功排除
+        conditions = [
+            "refund_time >= :start",
+            "refund_time <= :end",
+            "after_sale_status LIKE '%退款成功%'",
+            "after_sale_status NOT LIKE '%未发货%'",
+        ]
         params = {"start": str(start_date), "end": str(end_date)}
         if selected_flower != "（全部）":
             conditions.append("flower = :flower")
