@@ -14,7 +14,6 @@ from inventory_service import (
     get_current_stock,
     add_stock,
     deduct_stock,
-    rollback_daily_sales,
     rollback_inventory_to_date,
     sync_inventory_current_stock,
     update_inventory_snapshot,
@@ -387,68 +386,6 @@ class TestDailyAdjustExcludesRollbackLogs:
         assert "NOT LIKE '回退日报%'" in sql
         assert 'NOT LIKE :excl' in sql
         assert params.get('excl') == '本次调整%'
-
-
-# ===========================================================================
-# rollback_daily_sales  (transaction)
-# ===========================================================================
-
-class TestRollbackDailySales:
-
-    def test_no_logs_found(self, mock_conn):
-        """When no sales logs exist, should return (0, True, message)."""
-        mock_conn.execute.return_value.fetchall.return_value = []
-        count, ok, msg = rollback_daily_sales('2026-07-15')
-        assert count == 0
-        assert ok is True
-
-    def test_rollback_log_carries_effect_date(self, mock_conn):
-        """回退日志 INSERT 必须携带 effect_date = 被回退的那天（而非执行日），
-        否则按 created_at 归集会错位污染执行日快照（8/2 虚增 bug 根因）。"""
-        captured = []
-
-        def side_effect(sql, params=None, **kw):
-            s = str(sql)
-            if 'INSERT INTO inventory_log' in s and '手动调整' in s:
-                captured.append(params or {})
-            res = MagicMock()
-            if "change_type = '销售出库'" in s and 'reference LIKE' in s:
-                res.fetchall.return_value = [(1, '花型A', -10.0, 50.0, 40.0)]
-            else:
-                res.fetchall.return_value = []
-                res.rowcount = 1
-            return res
-
-        mock_conn.execute.side_effect = side_effect
-        with patch('inventory_service.get_current_stock', return_value=40.0):
-            count, ok, msg = rollback_daily_sales('2026-08-02')
-        assert ok is True
-        assert captured, '应写入回退日志'
-        assert captured[0].get('eff') == '2026-08-02'
-        assert '回退日报' in captured[0].get('ref', '')
-
-    def test_rollback_with_logs(self, mock_conn):
-        """When sales logs exist, should rollback and insert reversal logs."""
-        # First query: find sales logs
-        log_rows = [
-            (1, '花型A', -10.0, 50.0, 40.0),  # id, flower, change_qty, before, after
-            (2, '花型B', -20.0, 100.0, 80.0),
-        ]
-        mock_conn.execute.side_effect = [
-            MagicMock(fetchall=lambda: log_rows),  # FIND logs
-            # per-log: get_current_stock
-            # Each will use engine.connect() independently…
-        ]
-
-    def test_rollback_clean_command(self, mock_conn):
-        """Rollback also deletes shortfall records for the target date."""
-        mock_conn.execute.return_value.fetchall.return_value = [
-            (1, '花型A', -10.0, 50.0, 40.0),
-        ]
-        count, ok, msg = rollback_daily_sales('2026-07-15')
-        assert ok is True
-
-
 # ===========================================================================
 # update_inventory_snapshot
 # ===========================================================================

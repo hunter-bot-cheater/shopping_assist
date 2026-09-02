@@ -36,6 +36,38 @@ def get_flower_list():
 st.set_page_config(page_title="布料店库存管理系统", layout="wide")
 st.title("🧵 布料店库存管理系统")
 
+# 全局表格样式：仅作用于 number_input 步进按钮，去除点击后卡住的聚焦红
+st.markdown("""
+<style>
+/* number_input 步进按钮 (+/-) ：点击后聚焦态不再常驻红色，仅悬停时红 */
+div[data-testid="stNumberInput"] button,
+div[data-testid="stNumberInputStepUp"] button,
+div[data-testid="stNumberInputStepDown"] button {
+    transition: background-color 0.12s ease;
+}
+div[data-testid="stNumberInput"] button:focus,
+div[data-testid="stNumberInput"] button:focus-visible,
+div[data-testid="stNumberInput"] button:active,
+div[data-testid="stNumberInputStepUp"] button:focus,
+div[data-testid="stNumberInputStepUp"] button:focus-visible,
+div[data-testid="stNumberInputStepUp"] button:active,
+div[data-testid="stNumberInputStepDown"] button:focus,
+div[data-testid="stNumberInputStepDown"] button:focus-visible,
+div[data-testid="stNumberInputStepDown"] button:active {
+    background-color: rgba(151, 166, 195, 0.18) !important;
+    color: inherit !important;
+    box-shadow: none !important;
+    outline: none !important;
+}
+div[data-testid="stNumberInput"] button:hover,
+div[data-testid="stNumberInputStepUp"] button:hover,
+div[data-testid="stNumberInputStepDown"] button:hover {
+    background-color: #ff6b6b !important;
+    color: #ffffff !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ============================
 # 侧边栏菜单
 # ============================
@@ -53,15 +85,22 @@ st.sidebar.caption(f"当前时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}"
 
 if menu == "🏠 首页":
     from system_service import get_system_start_date
-    from inventory_service import get_system_status, get_missing_report_dates
+    from inventory_service import (
+        get_system_status, get_missing_report_dates,
+        fill_missing_snapshots,
+    )
+    from make_daily import generate_all_missing_reports
 
     start_date = get_system_start_date()
 
     st.header("🏠 系统状态看板")
     st.caption(f"📅 系统数据起始日期：**{start_date.strftime('%Y-%m-%d')}**（所有数据只显示此日期之后）")
 
-    sys_status = get_system_status()  # 重命名为 sys_status
+    sys_status = get_system_status()  # 含 latest_snapshot/latest_report/pending/missing_snapshots
+    missing_reports = get_missing_report_dates()
+    missing_snapshots = sys_status.get('missing_snapshots', [])
 
+    # ---------- 顶部指标 ----------
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         latest = sys_status.get('latest_snapshot')
@@ -73,48 +112,57 @@ if menu == "🏠 首页":
         pending = sys_status.get('pending_update_days', 0)
         st.metric("⏳ 待更新天数", f"{pending} 天")
     with col4:
-        missing_reports = get_missing_report_dates()
-        st.metric("⚠️ 缺失日报", f"{len(missing_reports)} 天", delta="请尽快生成" if len(missing_reports) > 0 else None)
+        st.metric("⚠️ 缺失日报", f"{len(missing_reports)} 天",
+                  delta="请尽快生成" if len(missing_reports) > 0 else None,
+                  delta_color="inverse" if len(missing_reports) > 0 else "normal")
 
     st.divider()
 
-    # 缺失日报
-    if missing_reports:
-        st.subheader("📋 缺失日报日期")
-        missing_dates = [d.strftime('%Y-%m-%d') for d in missing_reports if d is not None]
-        if len(missing_dates) > 30:
-            display_dates = missing_dates[:30]
-            st.write(", ".join(display_dates) + f", ... 共 {len(missing_dates)} 天")
-        else:
-            st.write(", ".join(missing_dates))
-
-        if st.button("一键生成所有缺失日报"):
-            with st.spinner("正在生成..."):
-                from make_daily import generate_all_missing_reports
-
-                generate_all_missing_reports()
-                st.success("✅ 所有缺失日报已生成")
-                st.rerun()
+    # ---------- 数据完整性总览 ----------
+    issues = len(missing_reports) + len(missing_snapshots)
+    if issues == 0:
+        st.success("✅ 数据完整，无需处理")
     else:
-        st.success("✅ 所有起始日期之后的订单均已生成日报")
+        st.warning(
+            f"⚠️ 共 {issues} 项需关注：缺失日报 {len(missing_reports)} 天、"
+            f"缺失快照 {len(missing_snapshots)} 天"
+        )
+        if st.button("🚀 一键补齐缺失数据（日报+快照）", type="primary"):
+            with st.spinner("正在补齐..."):
+                if missing_reports:
+                    generate_all_missing_reports()
+                if missing_snapshots:
+                    fill_missing_snapshots(operator="web")
+            st.success("✅ 缺失数据已补齐")
+            st.rerun()
 
-    # 缺失快照
-    missing_snapshots = sys_status.get('missing_snapshots', [])
-    if missing_snapshots:
-        st.subheader("📸 缺失库存快照")
+    # ---------- 日报 ----------
+    with st.expander(f"📊 日报（缺失 {len(missing_reports)} 天）", expanded=len(missing_reports) > 0):
+        if missing_reports:
+            missing_dates = [d.strftime('%Y-%m-%d') for d in missing_reports if d is not None]
+            if len(missing_dates) > 30:
+                st.write(", ".join(missing_dates[:30]) + f", ... 共 {len(missing_dates)} 天")
+            else:
+                st.write(", ".join(missing_dates))
+            if st.button("生成所有缺失日报"):
+                with st.spinner("正在生成..."):
+                    generate_all_missing_reports()
+                    st.success("✅ 所有缺失日报已生成")
+                    st.rerun()
+        else:
+            st.success("✅ 所有起始日期之后的订单均已生成日报")
+
+    # ---------- 库存快照 ----------
+    with st.expander(f"📸 库存快照（缺失 {len(missing_snapshots)} 天）", expanded=len(missing_snapshots) > 0):
         valid_snap = [d for d in missing_snapshots if d is not None and d >= start_date]
         if valid_snap:
             snap_dates = [d.strftime('%Y-%m-%d') for d in valid_snap]
             if len(snap_dates) > 30:
-                display_dates = snap_dates[:30]
-                st.write(", ".join(display_dates) + f", ... 共 {len(snap_dates)} 天")
+                st.write(", ".join(snap_dates[:30]) + f", ... 共 {len(snap_dates)} 天")
             else:
                 st.write(", ".join(snap_dates))
-
             if st.button("补全缺失快照"):
                 with st.spinner("正在补全..."):
-                    from inventory_service import fill_missing_snapshots
-
                     filled, fill_status, msg = fill_missing_snapshots(operator="web")
                     if fill_status == "no_report":
                         st.warning(msg)
@@ -127,9 +175,6 @@ if menu == "🏠 首页":
                         st.rerun()
         else:
             st.success("✅ 库存快照完整")
-    else:
-        st.success("✅ 库存快照完整")
-
 
 elif menu == "📤 导入订单":
     st.header("📤 导入订单 Excel")
@@ -175,6 +220,7 @@ elif menu == "📤 导入订单":
                     # 「开始导入」按钮返回 False，导致结果区不再渲染、回调失效。
                     st.session_state["import_result"] = result
                     st.session_state["import_just_done"] = True
+                    st.session_state["import_auto_regen_done"] = False
             except Exception as e:
                 st.error(f"❌ 读取文件失败：{e}")
                 st.session_state.pop("import_result", None)
@@ -192,39 +238,39 @@ elif menu == "📤 导入订单":
                 st.success(regen_msg)
             st.success(f"✅ {import_result['message']}")
 
-            # 📅 检测受影响日期，一键重新生成日报（放在靠上位置，无需下滑即可点击）
+            # 📅 导入后自动重新生成受影响日期的日报（未生成过的日期也会 force 生成）
             affected_dates = import_result.get("affected_dates") or []
-            if affected_dates:
-                st.divider()
-                st.info(
-                    f"📅 检测到 {len(affected_dates)} 个日期的订单数据发生变化："
-                    f"{', '.join(affected_dates)}"
-                )
-                if st.button("🚀 一键重新生成这些日期的日报", type="primary"):
-                    from make_daily import generate_daily_report
+            if affected_dates and not st.session_state.get("import_auto_regen_done", False):
+                from make_daily import generate_daily_report
 
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    total = len(affected_dates)
-                    failed_dates = []
-                    for i, date_str in enumerate(affected_dates):
-                        status_text.text(f"正在生成 {date_str} 日报...")
-                        try:
-                            generate_daily_report(date_str, force=True)
-                        except Exception as e:
-                            failed_dates.append(date_str)
-                            status_text.text(f"⚠️ {date_str} 日报生成失败：{e}")
-                        progress_bar.progress((i + 1) / total)
-                    # 清空受影响日期，防止重复点击重复生成
-                    import_result["affected_dates"] = []
-                    if failed_dates:
-                        st.session_state["import_regen_msg"] = (
-                            f"⚠️ {len(failed_dates)} 个日期日报生成失败：{', '.join(failed_dates)}"
-                        )
-                    else:
-                        st.session_state["import_regen_msg"] = f"✅ {total} 个变化日期的日报已重新生成！"
-                    st.balloons()
-                    st.rerun()
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                total = len(affected_dates)
+                failed_dates = []
+                for i, date_str in enumerate(affected_dates):
+                    status_text.text(f"正在生成/重生成 {date_str} 日报...")
+                    try:
+                        generate_daily_report(date_str, force=True)
+                    except Exception as e:
+                        failed_dates.append(date_str)
+                        status_text.text(f"⚠️ {date_str} 日报生成失败：{e}")
+                    progress_bar.progress((i + 1) / total)
+                # 记录已完成并清空受影响日期，防止下次 rerun 重复生成
+                st.session_state["import_auto_regen_done"] = True
+                import_result["affected_dates"] = []
+                if failed_dates:
+                    st.session_state["import_regen_msg"] = (
+                        f"⚠️ {len(failed_dates)} 天日报生成失败：{', '.join(failed_dates)}"
+                    )
+                else:
+                    st.session_state["import_regen_msg"] = (
+                        f"✅ 已自动生成/重生成 {total} 天日报：{', '.join(affected_dates)}"
+                    )
+                st.balloons()
+                st.rerun()
+            elif affected_dates:
+                # 已完成自动重生成后的兜底提示
+                st.info(f"📅 受影响日期日报已自动处理：{', '.join(affected_dates)}")
 
             # 🔧 显示订单变化（重点标注利润影响）
             changes = import_result.get("changes")
@@ -438,11 +484,17 @@ elif menu == "📋 库存流水":
 
 
 elif menu == "🚨 预警中心":
-    st.header("🚨 补货预警 & 拿货建议")
-    st.caption("💡 基于近7天销量和当前库存，为所有花型提供拿货建议，按紧急程度排序")
+    st.header("🚨 补货预警 & 拿货建议（按卷）")
+    st.caption("💡 基于销量窗口与EOQ模型给出按卷拿货建议；配送费影响补货周期与批量")
 
-    from inventory_service import get_inventory_report, get_latest_snapshot_date, get_restock_suggestions
+    from inventory_service import (
+        get_inventory_report, get_latest_snapshot_date,
+        get_restock_suggestions_roll, ensure_restock_config, get_restock_config, set_restock_config,
+    )
     from add_del_flower import get_available_flowers
+
+    ensure_restock_config()
+    cfg = get_restock_config()
 
     latest_date = get_latest_snapshot_date()
     if not latest_date:
@@ -450,135 +502,172 @@ elif menu == "🚨 预警中心":
     else:
         available_df = get_available_flowers()
         available_flowers = set(available_df['flower'].tolist())
-
         if not available_flowers:
             st.info("当前没有可用的花型")
         else:
             inv_df = get_inventory_report()
-
-            # 只保留可用花型（未删除的）
             inv_df = inv_df[inv_df['花型'].isin(available_flowers)]
-
             if inv_df.empty:
                 st.info("当前没有可用的花型数据")
             else:
-                # ==================== 拿货建议（所有花型） ====================
-                st.subheader("📦 拿货建议（按紧急程度排序）")
+                # ============ 拿货策略配置 ============
+                st.subheader("⚙️ 拿货策略配置")
+                c1, c2, c3, c4, c5 = st.columns(5)
+                with c1:
+                    window_days = st.selectbox("销量窗口(天)", [7, 14, 30], index=[7, 14, 30].index(int(cfg['restock_window_days'])), help="用近N天日均销量推算")
+                with c2:
+                    meters_per_roll = st.number_input("每卷米数", min_value=1.0, max_value=200.0, value=float(cfg['meters_per_roll']), step=1.0)
+                with c3:
+                    delivery_fee = st.number_input("配送费(每次)", min_value=0.0, max_value=9999.0, value=float(cfg['restock_delivery_fee']), step=10.0, help="有人配送的成本，影响补货周期与批量")
+                with c4:
+                    holding_rate = st.number_input("持有成本率/天", min_value=0.0, max_value=0.01, value=float(cfg['holding_rate']), step=0.0001, format="%.4f")
+                with c5:
+                    max_rolls = st.number_input("单次上限(卷)", min_value=1.0, max_value=999.0, value=float(cfg['max_rolls_per_order']), step=1.0)
 
-                # 可配置拿货目标天数
-                col_target, col_spacer = st.columns([1, 3])
-                with col_target:
-                    target_days = st.number_input(
-                        "拿货目标天数",
-                        min_value=1,
-                        max_value=30,
-                        value=7,
-                        step=1,
-                        help="建议拿够多少天的库存。例：7 表示建议拿货到够卖 7 天"
-                    )
+                if st.button("💾 保存拿货策略配置"):
+                    set_restock_config('meters_per_roll', meters_per_roll)
+                    set_restock_config('restock_delivery_fee', delivery_fee)
+                    set_restock_config('holding_rate', holding_rate)
+                    set_restock_config('max_rolls_per_order', max_rolls)
+                    set_restock_config('restock_window_days', int(window_days))
+                    st.success("✅ 配置已保存")
 
-                suggestions_df = get_restock_suggestions(target_days=target_days)
-
-                if suggestions_df.empty:
+                # ============ 拿货建议：采购计划（按日期） ============
+                st.subheader("📋 拿货采购计划（按日期）")
+                sug = get_restock_suggestions_roll(
+                    window_days=window_days, meters_per_roll=meters_per_roll,
+                    delivery_fee=delivery_fee, holding_rate=holding_rate, max_rolls=max_rolls,
+                )
+                if sug.empty:
                     st.info("暂无花型数据")
                 else:
-                    # 汇总统计
-                    total_suggest = suggestions_df['建议拿货(米)'].sum()
-                    need_restock = suggestions_df[suggestions_df['建议拿货(米)'] > 0]
-                    no_need = suggestions_df[suggestions_df['建议拿货(米)'] == 0]
+                    total_rolls = int(sug['建议拿卷'].sum())
+                    need = sug[sug['建议拿卷'] > 0].copy()
 
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("🌸 花型总数", f"{len(suggestions_df)} 个")
-                    with col2:
-                        st.metric("📦 建议总拿货量", f"{total_suggest:.1f} 米")
-                    with col3:
-                        st.metric("🔴 需要拿货", f"{len(need_restock)} 个花型",
-                                  delta=f"共 {need_restock['建议拿货(米)'].sum():.1f} 米" if len(need_restock) > 0 else None)
-                    with col4:
-                        st.metric("🟢 库存充足", f"{len(no_need)} 个花型")
-
-                    st.divider()
-
-                    # 表格样式：根据紧急程度着色
-                    def color_suggestions(row):
-                        days = row['可售天数']
-                        if days is None:
-                            # 无销量，灰色
-                            return ['color: #999'] * len(row)
-                        elif days <= 1:
-                            # 极度紧急，深红
-                            return ['background-color: #ff6b6b; color: white'] * len(row)
-                        elif days <= 3:
-                            # 紧急，浅红
-                            return ['background-color: #ffcccc'] * len(row)
-                        elif days <= 7:
-                            # 关注，浅黄
-                            return ['background-color: #fff3cd'] * len(row)
-                        elif row['建议拿货(米)'] > 0:
-                            # 有一些建议但不太紧急
-                            return ['background-color: #e8f5e9'] * len(row)
+                    # 以库存最新日 latest_date 为基准，推算每个花型应拿货的日期
+                    weekday_cn = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+                    plan = {}
+                    for _, r in need.iterrows():
+                        d = r['距下次拿货(天)']
+                        if d is None or isinstance(d, str):
+                            days = 0
                         else:
-                            # 库存充足，正常
+                            days = max(0, int(d) + (1 if (d - int(d)) > 1e-9 else 0))
+                        tgt = latest_date + timedelta(days=days)
+                        plan.setdefault(tgt, []).append((r['花型'], int(r['建议拿卷'])))
+
+                    if plan:
+                        base_wd = weekday_cn[latest_date.weekday()]
+                        st.caption(f"以下以库存最新日 {latest_date.strftime('%Y年%m月%d日')}（{base_wd}）为基准推算")
+                        for tgt in sorted(plan.keys()):
+                            items = plan[tgt]
+                            rolls = sum(x[1] for x in items)
+                            flist = "、".join(f"{f} ×{n}卷" for f, n in items)
+                            wd = weekday_cn[tgt.weekday()]
+                            st.markdown(
+                                f"**📅 {tgt.strftime('%Y年%m月%d日')}（{wd}）**：{flist}　——　**合计 {rolls} 卷**"
+                            )
+                    else:
+                        st.success("✅ 当前无需拿货，所有花型库存充足")
+
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a:
+                        st.metric("🌸 花型总数", f"{len(sug)} 个")
+                    with col_b:
+                        st.metric("📦 建议总拿货", f"{total_rolls} 卷（约 {total_rolls*meters_per_roll:.0f} 米）")
+                    with col_c:
+                        st.metric("🔴 需要拿货", f"{len(need)} 个花型")
+
+                    # ============ 拿货建议明细表（静止即着色的直观紧急度） ============
+                    st.subheader("📦 拿货建议明细（按卷，紧急度着色）")
+                    disp = sug.copy()
+                    for c in ['距下次拿货(天)', '经济周期(天)', '可售天数']:
+                        disp[c] = disp[c].apply(lambda x: "-" if x is None else x)
+                    disp['再订货点(卷)'] = disp['再订货点(卷)'].astype(int)
+                    disp['建议拿卷'] = disp['建议拿卷'].astype(int)
+
+                    def need_status(row):
+                        d = row['距下次拿货(天)']
+                        if isinstance(d, str) or d is None:
+                            return '充足'
+                        if d <= 0:
+                            return '立即'
+                        if d <= 3:
+                            return '3天内'
+                        if d <= 7:
+                            return '7天内'
+                        if row['建议拿卷'] > 0:
+                            return '需拿'
+                        return '充足'
+
+                    disp['拿货状态'] = disp.apply(need_status, axis=1)
+
+                    def color_rolls(row):
+                        d = row['距下次拿货(天)']
+                        if isinstance(d, str):
                             return [''] * len(row)
+                        if d <= 0:
+                            return ['background-color: #ff6b6b; color: white'] * len(row)
+                        elif d <= 3:
+                            return ['background-color: #ffb366'] * len(row)
+                        elif d <= 7:
+                            return ['background-color: #fff3cd'] * len(row)
+                        elif row['建议拿卷'] > 0:
+                            return ['background-color: #e8f5e9'] * len(row)
+                        return [''] * len(row)
 
-                    # 格式化显示：可售天数 None → "-"
-                    display_df = suggestions_df.copy()
-                    display_df['可售天数'] = display_df['可售天数'].apply(
-                        lambda x: "-" if x is None else x
-                    )
+                    disp = disp[['花型', '拿货状态', '当前库存(米)', '近N天日均(米)', '可售天数',
+                                '再订货点(卷)', '建议拿卷', '经济周期(天)', '距下次拿货(天)', '每卷米数']]
+                    st.dataframe(disp.style.apply(color_rolls, axis=1), use_container_width=True, height=520)
+                    st.caption("🔴 立即拿 | 🟠 距下次≤3天 | 🟡 ≤7天 | 🟢 需拿但不急 | ⬜ 充足")
 
-                    st.dataframe(
-                        display_df.style.apply(color_suggestions, axis=1),
-                        use_container_width=True,
-                        height=500
-                    )
-
-                    st.caption(
-                        "🔴 深红 = 可售 ≤1天（立即拿货） | "
-                        "🟠 浅红 = 可售 ≤3天 | "
-                        "🟡 浅黄 = 可售 ≤7天 | "
-                        "🟢 浅绿 = 需要拿货但不紧急 | "
-                        "⬜ 白色 = 库存充足 | "
-                        "⬜ 灰色 = 无销量"
-                    )
-
+                # ============ 库存预警（可售天数 ≤ 交期） ============
                 st.divider()
-
-                # ==================== 原有预警列表 ====================
-                st.subheader("⚠️ 库存预警明细（低于预警天数）")
-
+                st.subheader("⚠️ 库存预警明细（可售天数 ≤ 供应商交期）")
                 with engine.connect() as conn:
                     avg_sales = pd.read_sql(
-                        text("""
-                             SELECT flower, AVG(total_meters) as avg_daily
-                             FROM daily_report_cache
-                             WHERE report_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
-                             GROUP BY flower
-                             """),
-                        conn
+                        text("SELECT flower, AVG(total_meters) as avg_daily FROM daily_report_cache WHERE report_date >= DATE_SUB(CURDATE(), INTERVAL :w DAY) GROUP BY flower"),
+                        conn, params={"w": int(window_days)}
                     )
-                avg_map = dict(zip(avg_sales['flower'], avg_sales['avg_daily']))
-                inv_df['日均销量'] = inv_df['花型'].apply(lambda x: round(avg_map.get(x, 0), 2))
+                avg_map = dict(zip(avg_sales['flower'], avg_sales['avg_daily'])) if not avg_sales.empty else {}
+                inv_df['日均销量'] = inv_df['花型'].apply(lambda x: round(float(avg_map.get(x, 0) or 0), 2))
                 inv_df['可售天数'] = inv_df.apply(
-                    lambda row: round(row['当前库存(米)'] / row['日均销量'], 1) if row['日均销量'] > 0 else float(
-                        'inf'),
+                    lambda row: round(row['当前库存(米)'] / row['日均销量'], 1) if row['日均销量'] > 0 else float('inf'),
                     axis=1
                 )
+                with engine.connect() as conn:
+                    ls = pd.read_sql(text("SELECT flower, supplier_lead_time FROM inventory"), conn)
+                lead_map = dict(zip(ls['flower'], ls['supplier_lead_time'])) if not ls.empty else {}
+                inv_df['交期'] = inv_df['花型'].map(lambda f: int(lead_map.get(f, 3) or 3))
                 alert_df = inv_df[
                     (inv_df['可售天数'] != float('inf')) &
-                    (inv_df['可售天数'] < inv_df['预警天数'])
-                    ]
-
+                    (inv_df['可售天数'] <= inv_df['交期'])
+                ]
                 if not alert_df.empty:
                     st.dataframe(
-                        alert_df[['花型', '当前库存(米)', '日均销量', '可售天数', '预警天数']],
-                        use_container_width=True
+                        alert_df[['花型', '当前库存(米)', '日均销量', '可售天数', '交期', '预警天数']],
+                        use_container_width=True,
                     )
-                    st.caption(f"📊 当前监控花型数：{len(inv_df)} 个（已排除已删除花型）")
+                    st.caption(f"📊 监控花型数：{len(inv_df)} 个")
                 else:
-                    st.success("✅ 所有花型库存充足，暂无补货预警")
-                    st.caption(f"📊 当前监控花型数：{len(inv_df)} 个（已排除已删除花型）")
+                    st.success("✅ 所有花型可售天数均大于交期，暂无补货预警")
+
+                # ============ 超储预警 ============
+                st.divider()
+                st.subheader("🟦 超储预警（可售天数 > 60 且无近期销量）")
+                over_df = inv_df[
+                    (inv_df['可售天数'] != float('inf')) &
+                    (inv_df['可售天数'] > 60) &
+                    (inv_df['日均销量'] <= 0)
+                ]
+                if not over_df.empty:
+                    st.dataframe(
+                        over_df[['花型', '当前库存(米)', '日均销量', '可售天数']],
+                        use_container_width=True,
+                    )
+                    st.caption("以上花型长期无销量却占用库存，建议促销或停止拿货")
+                else:
+                    st.success("✅ 无明显的超储积压花型")
 
 elif menu == "📊 报告生成":
     st.header("📊 报告生成")
@@ -750,8 +839,18 @@ elif menu == "⚙️ 库存调整":
     st.markdown("---")
 elif menu == "📊 退款明细":
     st.header("📊 退款明细表")
-    st.info("💡 显示所有已发货且退款成功的订单明细（按退款时间倒序）")
+    st.info("💡 显示已发货/已收货且退款成功的订单明细（按退款时间倒序）")
 
+    # 同步按钮：清洗并刷新退款明细
+    if st.button("🔄 同步并清洗退款明细", key="sync_refund_btn"):
+        with st.spinner("正在同步并清理历史脏数据..."):
+            try:
+                from populate_refund_details import sync_refund_details
+                sync_refund_details()
+                st.success("✅ 退款明细同步完成")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ 同步失败：{e}")
     # 查询退款明细
     with engine.connect() as conn:
         # 获取所有花型（用于筛选）

@@ -8,6 +8,7 @@ from datetime import datetime
 import sqlalchemy
 
 from mysql_conn import engine
+from report_date_logic import ORDER_DATE_SQL, order_date_from_row
 
 # ============================
 # 配置
@@ -42,6 +43,7 @@ COLUMN_MAPPING = {
     "快递公司": "express_company",
     "parent_order_no": "parent_order_no",
     "订单成交时间": "order_time",
+    "订单付款时间": "payment_time",
     "是否分期": "installment",
     "分期期数": "installment_periods",
     "手续费承担方": "fee_bearer",
@@ -83,13 +85,14 @@ PLATFORM_COLUMN_MAPPINGS = {
         '订单应付金额': '商家实收金额(元)', '运费': '邮费(元)',
         '订单状态': '订单状态', '售后状态': '售后状态',
         '发货时间': '发货时间', '订单完成时间': '确认收货时间',
-        '订单提交时间': '订单成交时间', '物流SN码': '快递单号',
+        '订单提交时间': '订单成交时间', '支付完成时间': '订单付款时间',
+        '物流SN码': '快递单号',
         '商家备注': '商家备注', '取消原因': '_temp_close_reason',
     },
 }
 
 # 日期时间列（需要转换）
-DATETIME_COLUMNS = ["发货时间", "确认收货时间", "订单成交时间"]
+DATETIME_COLUMNS = ["发货时间", "确认收货时间", "订单成交时间", "订单付款时间"]
 
 # 文本列（需要去除制表符/空格）
 TEXT_COLUMNS = [
@@ -470,15 +473,16 @@ def import_excel(file_path=None):
         print(f"⚠️ 退款明细同步失败（不影响主导入）: {e}")
 
         # ============================================================
-        # 🆕 6. 自动生成缺失日期的日报
+        # 🆕 6. 自动生成缺失日期的日报（按下单日期统计）
         # ============================================================
-        if not df.empty and 'delivery_time' in df.columns:
+        if not df.empty:
             from make_daily import generate_daily_report
             from sqlalchemy import text
 
-            df['delivery_time'] = pd.to_datetime(df['delivery_time'], errors='coerce')
-            order_dates = df[df['delivery_time'].notna()]['delivery_time'].dt.date.unique()
-            order_dates = sorted(order_dates)
+            order_dates = sorted({
+                d for d in (order_date_from_row(row) for _, row in df.iterrows())
+                if d is not None
+            })
 
             if len(order_dates) > 0:
                 with engine.connect() as conn:
@@ -505,7 +509,7 @@ def import_excel(file_path=None):
                 else:
                     print("ℹ️ 所有订单日期均已有日报")
             else:
-                print("ℹ️ 导入数据中没有有效的发货日期")
+                print("ℹ️ 导入数据中没有有效的下单日期")
 
         return {
             "success": True,
@@ -896,7 +900,7 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
         stats["成功导入"] = total
 
         # ============================================================
-        # 第十步：收集受影响日期（有变化订单的发货日期，日报按发货时间统计）
+        # 第十步：收集受影响日期（有变化订单的下单日期，日报按下单日期统计）
         # ============================================================
         affected_dates = set()
         changes_df = changes.get("changes")
@@ -907,10 +911,13 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
                     placeholders = ', '.join([f':o{i}' for i in range(len(order_nos))])
                     params = {f'o{i}': on for i, on in enumerate(order_nos)}
                     query = sqlalchemy.text(f"""
-                        SELECT DISTINCT DATE(delivery_time) AS affected_date
-                        FROM {orders}
-                        WHERE order_no IN ({placeholders})
-                          AND delivery_time IS NOT NULL
+                        SELECT DISTINCT order_date AS affected_date
+                        FROM (
+                            SELECT {ORDER_DATE_SQL} AS order_date
+                            FROM {orders}
+                            WHERE order_no IN ({placeholders})
+                        ) t
+                        WHERE order_date IS NOT NULL
                     """)
                     rows = conn.execute(query, params).fetchall()
                     for row in rows:

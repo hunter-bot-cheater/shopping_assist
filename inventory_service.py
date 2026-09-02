@@ -2,6 +2,7 @@
 import pandas as pd
 from sqlalchemy import text
 from mysql_conn import engine
+from report_date_logic import ORDER_DATE_SQL
 from datetime import datetime, timedelta
 from system_service import get_system_start_date
 
@@ -321,7 +322,7 @@ def add_stock(flower, qty, reference="手动入库", operator="system", target_d
 # =============================================
 # 核心功能 2：销售出库（减少库存）
 # =============================================
-def deduct_stock(flower, qty, reference="销售出库", operator="system", report_date=None, is_daily_sales=False):
+def deduct_stock(flower, qty, reference="销售出库", operator="system", report_date=None, is_daily_sales=False, conn=None):
     """
     手动出库：直接扣减库存，同时更新 inventory 和 inventory_snapshot
     report_date: 出库日期。只影响该日期到下一个锚点（is_manual=1）之前的快照，
@@ -330,6 +331,8 @@ def deduct_stock(flower, qty, reference="销售出库", operator="system", repor
     会把当天销售烘焙进 snapshot[report_date]（end-of-day 语义），若日报扣减再以该
     快照为基准减去 qty 会双重扣减。故以 snapshot[report_date-1] 为基准，结合当日
     出入库/调整自愈重算，保证日报可反复重新生成而不累积误差。
+    conn: 可选，传入已开启的事务连接时，复用该连接、不自行提交/回滚，
+    由调用方统一提交或整体回滚（如日报重算的「回退+重扣」单事务场景）。
     """
     if qty <= 0:
         raise ValueError("出库数量必须大于 0")
@@ -340,206 +343,116 @@ def deduct_stock(flower, qty, reference="销售出库", operator="system", repor
 
     report_date = _normalize_date(report_date)
 
+    if conn is not None:
+        # 调用方已开启事务：直接执行，提交/回滚由调用方负责
+        _deduct_stock_core(conn, flower, qty, reference, operator, report_date, is_daily_sales)
+        return
+
     with engine.connect() as conn:
         trans = conn.begin()
         try:
-            # 0. 日报路径：若 report_date 为手动锚点（is_manual=1），锚点是实盘数、
-            #    已含当日销售，任何公式扣减都会破坏锚点，直接跳过
-            if is_daily_sales:
-                anchor_row = conn.execute(
-                    text("SELECT is_manual FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
-                    {"f": flower, "d": report_date}
-                ).fetchone()
-                if anchor_row is not None and anchor_row[0]:
-                    print(f"⏭️ {flower} {report_date} 为手动锚点（is_manual=1），日报扣减跳过，锚点为实盘数")
-                    return
-
-            # 1. 确保目标日期及之后有快照记录（沿用原逻辑，缺失时先补全）
-            check_snapshot = conn.execute(
-                text("SELECT COUNT(*) FROM inventory_snapshot WHERE flower = :f AND snapshot_date >= :d"),
-                {"f": flower, "d": report_date}
-            ).scalar()
-
-            if check_snapshot == 0:
-                print(f"⚠️ {flower} 从 {report_date} 起没有快照记录，正在补全...")
-                from inventory_service import fill_missing_snapshots
-                fill_missing_snapshots(operator=operator)
-
-            # 2. 确定扣减基准
-            if is_daily_sales:
-                # 日报路径：snapshot[report_date] 可能已被补全逻辑烘焙成含当天销售的
-                # end-of-day 值，不能直接作为基准。以 snapshot[report_date-1] 推算
-                # 当日 end-of-day，实现自愈（可反复重新生成，不累积双重扣减）。
-                prev_date = report_date - timedelta(days=1)
-                prev_row = conn.execute(
-                    text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
-                    {"f": flower, "d": prev_date}
-                ).fetchone()
-                if prev_row is not None:
-                    snap_before = float(prev_row[0])
-                else:
-                    snap_before = _ensure_snapshot_stock(conn, flower, prev_date, operator)
-                snap_after = max(
-                    snap_before - qty
-                    + _daily_inbound(conn, flower, report_date)
-                    + _daily_adjust(conn, flower, report_date),
-                    0
-                )
-                actual_deduct = qty
-            else:
-                # 手动路径：读取 report_date 快照旧值（无则推算创建），用于日志与扣减基准
-                snap_before_row = conn.execute(
-                    text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
-                    {"f": flower, "d": report_date}
-                ).fetchone()
-                if snap_before_row is not None:
-                    snap_before = float(snap_before_row[0])
-                else:
-                    snap_before = _ensure_snapshot_stock(conn, flower, report_date, operator)
-                snap_after = max(snap_before - qty, 0)
-                actual_deduct = snap_before - snap_after
-
-            # 3. 更新 report_date 快照（扣减，不低于 0；无则插入，保留 is_manual 原值）
-            conn.execute(
-                text("""
-                    INSERT INTO inventory_snapshot (flower, snapshot_date, stock, is_manual, updated_by, updated_at)
-                    VALUES (:f, :d, :new, 0, :op, CURRENT_TIMESTAMP)
-                    ON DUPLICATE KEY UPDATE stock = :new2, updated_by = :op2, updated_at = CURRENT_TIMESTAMP
-                """),
-                {"f": flower, "d": report_date, "new": snap_after, "op": operator,
-                 "new2": snap_after, "op2": operator}
-            )
-
-            # 4. 确定重算区间（report_date 之后到下一个锚点之前）
-            next_anchor = _get_next_anchor(conn, flower, report_date)
-            if next_anchor is not None:
-                end_date = next_anchor - timedelta(days=1)
-            else:
-                end_date = _get_latest_snapshot_date_for(conn, flower)
-
-            # 5. 逐日重算后续快照（不越过锚点）
-            affected = _recompute_segment(
-                conn, flower, report_date, snap_after, end_date, operator
-            )
-
-            # 6. 写入流水（用快照值）
-            _write_log(
-                conn, flower, '销售出库', -actual_deduct, snap_before, snap_after,
-                reference, operator, effect_date=report_date
-            )
-
-            # 7. 同步 current_stock = 最新快照
-            _sync_current_stock(conn, flower)
-
+            _deduct_stock_core(conn, flower, qty, reference, operator, report_date, is_daily_sales)
             trans.commit()
-            print(f"🔍 快照表重算影响 {affected} 天（从 {report_date} 起到下一个锚点之前）")
-
-            if snap_before < qty:
-                print(f"⚠️ {flower} 库存不足：当前 {snap_before} 米，出库 {qty} 米，实际扣减 {actual_deduct} 米，库存保持为 0")
-            else:
-                print(f"✅ {flower} 扣减 {qty} 米（剩余：{snap_after}）")
-
         except Exception as e:
             trans.rollback()
             raise e
-# =============================================
-# 核心功能 3：回退某一天的销售出库（用于日报重新生成）
-# =============================================
-def rollback_daily_sales(target_date, operator="system"):
-    """
-    回退指定日期的所有销售出库（撤销日报扣减的库存）
-    返回：(回退记录数, 是否成功, 消息)
-    """
-    with engine.connect() as conn:
-        trans = conn.begin()
-        try:
-            # 查询该日期所有销售出库记录（优先用 reference 模糊匹配）
-            logs = conn.execute(
-                text("""
-                    SELECT id, flower, change_qty, before_stock, after_stock
-                    FROM inventory_log
-                    WHERE change_type = '销售出库'
-                      AND reference LIKE :ref_pattern
-                """),
-                {"ref_pattern": f"%{target_date}%"}
-            ).fetchall()
 
-            # 如果没找到，再用日期匹配
-            if not logs:
-                logs = conn.execute(
-                    text("""
-                        SELECT id, flower, change_qty, before_stock, after_stock
-                        FROM inventory_log
-                        WHERE change_type = '销售出库'
-                          AND DATE(created_at) = :d
-                    """),
-                    {"d": target_date}
-                ).fetchall()
 
-            if not logs:
-                trans.commit()
-                return (0, True, f"ℹ️ 未找到 {target_date} 的销售出库记录")  # 统一返回三个值
+def _deduct_stock_core(conn, flower, qty, reference, operator, report_date, is_daily_sales):
+    # 0. 日报路径：若 report_date 为手动锚点（is_manual=1），锚点是实盘数、
+    #    已含当日销售，任何公式扣减都会破坏锚点，直接跳过
+    if is_daily_sales:
+        anchor_row = conn.execute(
+            text("SELECT is_manual FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+            {"f": flower, "d": report_date}
+        ).fetchone()
+        if anchor_row is not None and anchor_row[0]:
+            print(f"⏭️ {flower} {report_date} 为手动锚点（is_manual=1），日报扣减跳过，锚点为实盘数")
+            return
 
-            # 回退库存
-            for log in logs:
-                log_id = log[0]
-                flower = log[1]
-                change_qty = float(log[2])  # 负数
-                before_stock = float(log[3])
-                after_stock = float(log[4])
+    # 1. 确保目标日期及之后有快照记录（沿用原逻辑，缺失时先补全）
+    check_snapshot = conn.execute(
+        text("SELECT COUNT(*) FROM inventory_snapshot WHERE flower = :f AND snapshot_date >= :d"),
+        {"f": flower, "d": report_date}
+    ).scalar()
 
-                current = get_current_stock(flower)
-                target_stock = current - change_qty  # 减去负数 = 加回来
+    if check_snapshot == 0:
+        print(f"⚠️ {flower} 从 {report_date} 起没有快照记录，正在补全...")
+        from inventory_service import fill_missing_snapshots
+        fill_missing_snapshots(operator=operator)
 
-                conn.execute(
-                    text("UPDATE inventory SET current_stock = :new WHERE flower = :f"),
-                    {"new": target_stock, "f": flower}
-                )
+    # 2. 确定扣减基准
+    if is_daily_sales:
+        # 日报路径：snapshot[report_date] 可能已被补全逻辑烘焙成含当天销售的
+        # end-of-day 值，不能直接作为基准。以 snapshot[report_date-1] 推算
+        # 当日 end-of-day，实现自愈（可反复重新生成，不累积双重扣减）。
+        prev_date = report_date - timedelta(days=1)
+        prev_row = conn.execute(
+            text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+            {"f": flower, "d": prev_date}
+        ).fetchone()
+        if prev_row is not None:
+            snap_before = float(prev_row[0])
+        else:
+            snap_before = _ensure_snapshot_stock(conn, flower, prev_date, operator)
+        snap_after = max(
+            snap_before - qty
+            + _daily_inbound(conn, flower, report_date)
+            + _daily_adjust(conn, flower, report_date),
+            0
+        )
+        actual_deduct = qty
+    else:
+        # 手动路径：读取 report_date 快照旧值（无则推算创建），用于日志与扣减基准
+        snap_before_row = conn.execute(
+            text("SELECT stock FROM inventory_snapshot WHERE flower = :f AND snapshot_date = :d"),
+            {"f": flower, "d": report_date}
+        ).fetchone()
+        if snap_before_row is not None:
+            snap_before = float(snap_before_row[0])
+        else:
+            snap_before = _ensure_snapshot_stock(conn, flower, report_date, operator)
+        snap_after = max(snap_before - qty, 0)
+        actual_deduct = snap_before - snap_after
 
-                # ★ 修复：同步回退 inventory_snapshot（change_qty 为负数，减负数=加回）
-                result_snap = conn.execute(
-                    text("""
-                        UPDATE inventory_snapshot
-                        SET stock = GREATEST(stock - :qty, 0),
-                            updated_by = :op,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE flower = :f AND snapshot_date >= :d
-                    """),
-                    {"qty": change_qty, "op": operator, "f": flower, "d": target_date}
-                )
-                print(f"🔍 快照表回退影响行数：{result_snap.rowcount}（从 {target_date} 起，花型 {flower}）")
+    # 3. 更新 report_date 快照（扣减，不低于 0；无则插入，保留 is_manual 原值）
+    conn.execute(
+        text("""
+            INSERT INTO inventory_snapshot (flower, snapshot_date, stock, is_manual, updated_by, updated_at)
+            VALUES (:f, :d, :new, 0, :op, CURRENT_TIMESTAMP)
+            ON DUPLICATE KEY UPDATE stock = :new2, updated_by = :op2, updated_at = CURRENT_TIMESTAMP
+        """),
+        {"f": flower, "d": report_date, "new": snap_after, "op": operator,
+         "new2": snap_after, "op2": operator}
+    )
 
-                conn.execute(
-                    text("""
-                        INSERT INTO inventory_log
-                        (flower, change_type, change_qty, before_stock, after_stock, reference, operator, effect_date)
-                        VALUES (:f, '手动调整', :qty, :before, :after, :ref, :op, :eff)
-                    """),
-                    {
-                        "f": flower,
-                        "qty": -change_qty,
-                        "before": current,
-                        "after": target_stock,
-                        "ref": f"回退日报 {target_date}（重新生成前）",
-                        "op": operator,
-                        "eff": target_date
-                    }
-                )
+    # 4. 确定重算区间（report_date 之后到下一个锚点之前）
+    next_anchor = _get_next_anchor(conn, flower, report_date)
+    if next_anchor is not None:
+        end_date = next_anchor - timedelta(days=1)
+    else:
+        end_date = _get_latest_snapshot_date_for(conn, flower)
 
-            # 删除该日期的缺口记录（如果有）
-            conn.execute(
-                text("DELETE FROM inventory_shortfall WHERE reference_date = :d"),
-                {"d": target_date}
-            )
+    # 5. 逐日重算后续快照（不越过锚点）
+    affected = _recompute_segment(
+        conn, flower, report_date, snap_after, end_date, operator
+    )
 
-            trans.commit()
-            return (len(logs), True, f"✅ 成功回退 {len(logs)} 条销售出库记录")
+    # 6. 写入流水（用快照值）
+    _write_log(
+        conn, flower, '销售出库', -actual_deduct, snap_before, snap_after,
+        reference, operator, effect_date=report_date
+    )
 
-        except Exception as e:
-            trans.rollback()
-            return (0, False, f"❌ 回退异常：{str(e)}")
+    # 7. 同步 current_stock = 最新快照
+    _sync_current_stock(conn, flower)
 
-# =============================================
+    print(f"🔍 快照表重算影响 {affected} 天（从 {report_date} 起到下一个锚点之前）")
+
+    if snap_before < qty:
+        print(f"⚠️ {flower} 库存不足：当前 {snap_before} 米，出库 {qty} 米，实际扣减 {actual_deduct} 米，库存保持为 0")
+    else:
+        print(f"✅ {flower} 扣减 {qty} 米（剩余：{snap_after}）")
 # 核心功能 4：查看所有库存
 # =============================================
 def get_inventory_report():
@@ -1227,7 +1140,92 @@ def get_system_status():
         )
         status['recent_changes'] = recent_changes if not recent_changes.empty else None
 
+        # 库存一致性对账（只读，不写不删）
+        try:
+            drift = check_inventory_consistency()
+            status['drift_detail'] = drift
+            status['drift_count'] = len(drift)
+        except Exception:
+            status['drift_detail'] = None
+            status['drift_count'] = 0
+
         return status
+
+
+def check_inventory_consistency(epsilon=0.01):
+    """只读对账：比对 inventory.current_stock 与各花型最新快照，识别漂移/负值/回退伪影。
+
+    返回 DataFrame（空=一致），列：花型, 类型, 当前库存, 快照库存, 差值, 说明。
+    不写库、不删库，仅巡检。
+    """
+    rows = []
+    with engine.connect() as conn:
+        # A. 主表 vs 最新快照
+        cur = conn.execute(text("""
+            SELECT inv.flower, inv.current_stock,
+                   (SELECT s.stock FROM inventory_snapshot s
+                    WHERE s.flower = inv.flower ORDER BY s.snapshot_date DESC LIMIT 1) AS snap_stock
+            FROM inventory inv
+        """))
+        for flower, cur_stock, snap_stock in cur.fetchall():
+            cur_stock = float(cur_stock) if cur_stock is not None else 0.0
+            if snap_stock is None:
+                rows.append((flower, '无快照', round(cur_stock, 2), None, None,
+                             'current_stock 有值但无快照，无法核对'))
+                continue
+            snap_stock = float(snap_stock)
+            diff = cur_stock - snap_stock
+            if abs(diff) > epsilon:
+                rows.append((flower, '主表漂移', round(cur_stock, 2), round(snap_stock, 2),
+                             round(diff, 2), f'current_stock 与最新快照差 {diff:.2f} 米'))
+
+        # B. 快照负值
+        neg = conn.execute(
+            text("SELECT flower, snapshot_date, stock FROM inventory_snapshot WHERE stock < :eps ORDER BY snapshot_date"),
+            {"eps": -epsilon}
+        )
+        for flower, d, stock in neg.fetchall():
+            stock = float(stock)
+            rows.append((flower, '快照负值', None, round(stock, 2), round(stock, 2),
+                         f'{d} 快照库存为负 {stock:.2f} 米'))
+
+        # C. 回退伪影：change_type=手动调整 且 reference LIKE 回退日报% 且 change_qty>0
+        art = conn.execute(text("""
+            SELECT flower, reference, change_qty, effect_date
+            FROM inventory_log
+            WHERE change_type = '手动调整' AND reference LIKE '回退日报%' AND change_qty > 0
+            ORDER BY effect_date
+        """))
+        for flower, ref, qty, eff in art.fetchall():
+            qty = float(qty)
+            rows.append((flower, '回退伪影', None, None, round(qty, 2),
+                         f'流水「{ref}」({eff}) 疑似重复回退，change_qty={qty:.2f}'))
+
+    if not rows:
+        return pd.DataFrame(columns=['花型', '类型', '当前库存', '快照库存', '差值', '说明'])
+    return pd.DataFrame(rows, columns=['花型', '类型', '当前库存', '快照库存', '差值', '说明'])
+
+
+def clean_rollback_artifacts():
+    """清理回退伪影：删除 inventory_log 中 change_type='手动调整' 且 reference LIKE '回退日报%' 且 change_qty>0 的疑似重复回退流水。
+
+    仅删流水，不动库存。返回删除条数。
+    """
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            res = conn.execute(text("""
+                DELETE FROM inventory_log
+                WHERE change_type = '手动调整' AND reference LIKE '回退日报%' AND change_qty > 0
+            """))
+            n = res.rowcount or 0
+            trans.commit()
+            return n
+        except Exception:
+            trans.rollback()
+            raise
+
+
 def get_missing_report_dates():
     """获取缺失日报的日期（有订单但没生成日报），只显示起始日期之后"""
     from system_service import get_system_start_date
@@ -1237,12 +1235,15 @@ def get_missing_report_dates():
     with engine.connect() as conn:
         # 只获取起始日期之后的订单
         order_dates = conn.execute(
-            text("""
-                SELECT DISTINCT DATE(order_time)
-                FROM data2026
-                WHERE order_time IS NOT NULL
-                  AND DATE(order_time) >= :start
-                ORDER BY DATE(order_time)
+            text(f"""
+                SELECT DISTINCT order_date
+                FROM (
+                    SELECT {ORDER_DATE_SQL} AS order_date
+                    FROM data2026
+                ) t
+                WHERE order_date IS NOT NULL
+                  AND order_date >= :start
+                ORDER BY order_date
             """),
             {"start": start_date}
         ).fetchall()
@@ -1370,6 +1371,221 @@ def check_flower_active(flower):
 # =============================================
 # 测试代码
 # =============================================
+# =============================================
+# 拿货建议（按卷 / EOQ 模型）
+# 配置项存于 system_config：
+#   meters_per_roll        每卷米数（默认45，可改）
+#   restock_delivery_fee   单次拿货配送费 K（默认80，UI 可调，影响补货周期与批量）
+#   holding_rate           每卷日持有成本率 r（默认0.0003，约年化11%）
+#   max_rolls_per_order    单次最多拿卷数（默认50，资金/搬运上限）
+#   restock_window_days    默认销量窗口天数（默认14）
+# =============================================
+
+RESTOCK_CONFIG_DEFAULTS = [
+    ('meters_per_roll', '45', '每卷米数（布料按卷采购，1卷=该米数）'),
+    ('restock_delivery_fee', '80', '单次拿货配送费（有人配送的成本，影响补货周期与批量）'),
+    ('holding_rate', '0.0003', '每卷每日资金占用成本率（用于EOQ）'),
+    ('max_rolls_per_order', '50', '单次最多拿多少卷（资金/搬运上限）'),
+    ('restock_window_days', '14', '拿货建议默认销量窗口天数'),
+]
+
+
+def ensure_restock_config():
+    """幂等写入拿货建议默认配置（已存在则跳过）。"""
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            for k, v, d in RESTOCK_CONFIG_DEFAULTS:
+                conn.execute(
+                    text("INSERT IGNORE INTO system_config (config_key, config_value, description) "
+                         "VALUES (:k, :v, :d)"),
+                    {"k": k, "v": v, "d": d}
+                )
+            trans.commit()
+        except Exception as e:
+            trans.rollback()
+            raise e
+
+
+def get_restock_config():
+    """读取拿货建议配置，缺失项回退默认值。"""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT config_key, config_value FROM system_config")
+        ).fetchall()
+    raw = {r[0]: r[1] for r in rows}
+    out = {}
+    for k, v, _ in RESTOCK_CONFIG_DEFAULTS:
+        if k in raw:
+            try:
+                out[k] = float(raw[k])
+            except (ValueError, TypeError):
+                out[k] = float(v)
+        else:
+            out[k] = float(v)
+    out['restock_window_days'] = int(out.get('restock_window_days', 14))
+    return out
+
+
+def set_restock_config(key, value):
+    """写入单个拿货建议配置（UPSERT）。"""
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            conn.execute(
+                text("""INSERT INTO system_config (config_key, config_value, description)
+                    VALUES (:k, :v, :d)
+                    ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)"""),
+                {"k": key, "v": str(value), "d": "拿货建议配置"}
+            )
+            trans.commit()
+        except Exception as e:
+            trans.rollback()
+            raise e
+
+
+def get_avg_daily_sales(window_days=14):
+    """返回 {flower: 近 window_days 天日均销量(米)}。"""
+    with engine.connect() as conn:
+        df = pd.read_sql(
+            text("""
+                SELECT flower, AVG(total_meters) AS avg_daily
+                FROM daily_report_cache
+                WHERE report_date >= DATE_SUB(CURDATE(), INTERVAL :w DAY)
+                GROUP BY flower
+            """),
+            conn, params={"w": int(window_days)}
+        )
+    return dict(zip(df['flower'], df['avg_daily'])) if not df.empty else {}
+
+
+def get_restock_suggestions_roll(window_days=None, meters_per_roll=None,
+                                 delivery_fee=None, holding_rate=None,
+                                 max_rolls=None):
+    """
+    按卷拿货建议（EOQ 模型，配送费 K 影响补货周期与批量）。
+
+    每个花型：
+      M        = 每卷米数
+      d_m      = 近 window_days 天日均销量(米)
+      d_roll   = d_m / M                     日均卷需求
+      V        = cost_per_meter * M          每卷价值（来自成本表）
+      h_roll   = V * r                        每卷每日持有成本
+      K        = 配送费（UI 可调）
+      EOQ      = sqrt(2 * d_roll * 365 * K / h_roll)
+      T_star   = EOQ / d_roll                 经济补货周期(天)
+      ROP_roll = ceil((L + S) * d_roll)       再订货点(卷)  L=交期 S=安全天数
+      S_roll   = ceil((T_star + L + S) * d_roll)  目标上限(卷)
+      建议卷   = clamp(ceil(S_roll - 当前卷), 0, max_rolls)
+      距下次   = (当前卷 - ROP_roll) / d_roll 天（<=0 立即拿）
+
+    返回 DataFrame 列：
+    ['花型','当前库存(米)','近N天日均(米)','可售天数','再订货点(卷)',
+     '建议拿卷','经济周期(天)','距下次拿货(天)','每卷米数']
+    """
+    import math
+    from add_del_flower import get_available_flowers
+
+    cfg = get_restock_config()
+    M = float(meters_per_roll if meters_per_roll is not None else cfg['meters_per_roll'])
+    K = float(delivery_fee if delivery_fee is not None else cfg['restock_delivery_fee'])
+    r = float(holding_rate if holding_rate is not None else cfg['holding_rate'])
+    max_rolls = float(max_rolls if max_rolls is not None else cfg['max_rolls_per_order'])
+    if window_days is None:
+        window_days = int(cfg['restock_window_days'])
+
+    available_df = get_available_flowers()
+    if available_df.empty:
+        cols = ['花型', '当前库存(米)', '近N天日均(米)', '可售天数', '再订货点(卷)',
+                '建议拿卷', '经济周期(天)', '距下次拿货(天)', '每卷米数']
+        return pd.DataFrame(columns=cols)
+    available = set(available_df['flower'].tolist())
+
+    latest = get_latest_snapshot_date()
+    if not latest:
+        cols = ['花型', '当前库存(米)', '近N天日均(米)', '可售天数', '再订货点(卷)',
+                '建议拿卷', '经济周期(天)', '距下次拿货(天)', '每卷米数']
+        return pd.DataFrame(columns=cols)
+
+    inv_df = get_inventory_snapshot(latest)
+    if inv_df.empty:
+        cols = ['花型', '当前库存(米)', '近N天日均(米)', '可售天数', '再订货点(卷)',
+                '建议拿卷', '经济周期(天)', '距下次拿货(天)', '每卷米数']
+        return pd.DataFrame(columns=cols)
+    inv_df = inv_df[inv_df['花型'].isin(available)].copy()
+
+    with engine.connect() as conn:
+        cost_df = pd.read_sql(
+            text("SELECT flower, cost_per_meter FROM product_cost WHERE is_deleted = 0"),
+            conn
+        )
+        ls_df = pd.read_sql(
+            text("SELECT flower, alert_days, supplier_lead_time FROM inventory"),
+            conn
+        )
+    cost_map = dict(zip(cost_df['flower'], cost_df['cost_per_meter'])) if not cost_df.empty else {}
+    ls_map = {
+        row['flower']: (row['alert_days'], row['supplier_lead_time'])
+        for _, row in ls_df.iterrows()
+    } if not ls_df.empty else {}
+
+    avg_map = get_avg_daily_sales(window_days)
+
+    rows = []
+    for _, row in inv_df.iterrows():
+        flower = row['花型']
+        cur_m = float(row['库存'])
+        d_m = float(avg_map.get(flower, 0) or 0)
+        d_roll = d_m / M if M > 0 else 0.0
+        cost_pm = float(cost_map.get(flower, 0) or 0)
+        V = cost_pm * M
+        h_roll = V * r
+        S_days, L = ls_map.get(flower, (7, 3))
+        S_days = int(S_days) if S_days else 7
+        L = int(L) if L else 3
+
+        if d_roll > 0 and h_roll > 0:
+            eoq = math.sqrt(2 * d_roll * 365 * K / h_roll)
+            t_star = eoq / d_roll
+        else:
+            eoq = 0.0
+            t_star = float('inf')
+
+        rop_rolls = math.ceil((L + S_days) * d_roll) if d_roll > 0 else 0
+        target_rolls = math.ceil((t_star + L + S_days) * d_roll) if d_roll > 0 else 0
+        cur_rolls = cur_m / M
+
+        if d_roll > 0:
+            sugg = max(0, min(max_rolls, math.ceil(target_rolls - cur_rolls)))
+            if cur_rolls < rop_rolls:
+                sugg = max(sugg, math.ceil(target_rolls - cur_rolls))
+                sugg = min(sugg, max_rolls)
+        else:
+            sugg = 0
+
+        sellable = cur_m / d_m if d_m > 0 else float('inf')
+        days_to = (cur_rolls - rop_rolls) / d_roll if d_roll > 0 else float('inf')
+
+        rows.append({
+            '花型': flower,
+            '当前库存(米)': round(cur_m, 1),
+            '近N天日均(米)': round(d_m, 2),
+            '可售天数': round(sellable, 1) if sellable != float('inf') else None,
+            '再订货点(卷)': int(rop_rolls),
+            '建议拿卷': int(sugg),
+            '经济周期(天)': round(t_star, 1) if t_star != float('inf') else None,
+            '距下次拿货(天)': round(days_to, 1) if days_to != float('inf') else None,
+            '每卷米数': M,
+        })
+
+    result = pd.DataFrame(rows)
+    # 排序：距下次拿货升序（None 排最后），建议卷降序
+    result['_sort'] = result['距下次拿货(天)'].apply(lambda x: x if x is not None else 999999)
+    result = result.sort_values(['_sort', '建议拿卷'], ascending=[True, False]).reset_index(drop=True)
+    result = result.drop(columns=['_sort'])
+    return result
+
+
 if __name__ == "__main__":
     print("🧪 测试库存服务...")
     print(get_inventory_report().head())

@@ -32,7 +32,6 @@ def test_import_inventory_service():
     assert hasattr(inventory_service, 'fill_missing_snapshots')
     assert hasattr(inventory_service, 'update_inventory_snapshot')
     assert hasattr(inventory_service, 'get_restock_suggestions')
-    assert hasattr(inventory_service, 'rollback_daily_sales')
     assert hasattr(inventory_service, 'get_system_status')
     assert hasattr(inventory_service, 'get_missing_report_dates')
 

@@ -19,7 +19,8 @@ repair_double_deduct_snapshots.py
 repair_restore_730_anchors.py
 repair_rollback_artifacts.py
 sync_current_stock_20260802.py
-
+migrate_payment_time.py
+_check_taobao_file.py
 #.coverage相关
 .coverage
 .coverage.*
