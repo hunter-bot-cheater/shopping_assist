@@ -243,7 +243,9 @@ def get_order_key(row):
 def _match_flowers_and_calc(df, cost_map):
     """花型四层匹配 + 米数/成本/快递费/盈利 + 退款标记 + 平台名。
 
-    返回 (df, matched_count, unmatched_count)；无匹配订单时 df 为 None。
+    返回 (df, matched_count, unmatched_count, unmatched_df)；
+    df 为匹配成功订单（进入汇总/库存/缓存）；unmatched_df 为未匹配订单
+    （花型='待建成本'，成本/盈利=0，营业额真实保留，供报表单独呈现，不进库存）。
     """
     cost_flowers = set(cost_map.keys())
     df = assign_flowers(df, cost_flowers)
@@ -252,7 +254,7 @@ def _match_flowers_and_calc(df, cost_map):
     final_unmatched = df[df['花型'] == '未匹配']
     if not final_unmatched.empty:
         print("\n" + "=" * 80)
-        print("🚫 所有匹配策略均未成功的订单明细（已从日报中过滤，请人工核查）：")
+        print("🚫 以下订单未匹配到成本表花型，将单独汇总为「待建成本」（营业额不遗漏）：")
         print("-" * 80)
         print(final_unmatched[['order_no', 'product', 'product_spec']].to_string(index=False))
         print("=" * 80 + "\n")
@@ -265,10 +267,31 @@ def _match_flowers_and_calc(df, cost_map):
     unmatched_count = len(unmatched_df)
     print(f"✅ 匹配成功: {matched_count} 条")
     if unmatched_count > 0:
-        print(f"⚠️ 未匹配（将被过滤）: {unmatched_count} 条")
+        print(f"⚠️ 未匹配（单独汇总为「待建成本」）: {unmatched_count} 条")
+
+    # 未匹配订单：标为「待建成本」，成本/快递费/盈利未知置 0（营业额与米数真实保留）
+    if not unmatched_df.empty:
+        unmatched_df['花型'] = '待建成本'
+        unmatched_df['平台'] = unmatched_df['platform'].map(PLATFORM_NAMES).fillna('拼多多')
+        unmatched_df['单位米数'] = unmatched_df['product_spec'].apply(extract_meter_from_spec)
+        unmatched_df.loc[unmatched_df['单位米数'] == 0, '单位米数'] = 1
+        unmatched_df['米数'] = (
+            (unmatched_df['单位米数'] * unmatched_df['product_quantity'] * 2).round() / 2
+        ).round(2)
+        unmatched_df['成本'] = 0.0
+        unmatched_df['快递费'] = 0.0
+        unmatched_df['盈利'] = 0.0
+        unmatched_df['是否退款'] = (
+            unmatched_df['after_sale_status'].astype(str).str.contains('退款成功', na=False)
+            | unmatched_df['order_status'].astype(str).str.contains('退款成功', na=False)
+        )
+        unmatched_df['发货退款'] = unmatched_df['是否退款'] & (
+            unmatched_df['order_status'].astype(str).str.contains('已发货|已收货', na=False, regex=True)
+            | unmatched_df['after_sale_status'].astype(str).str.contains('已发货|已收货', na=False, regex=True)
+        )
 
     if matched_df.empty:
-        return None, matched_count, unmatched_count
+        return None, matched_count, unmatched_count, unmatched_df
 
     df = matched_df
 
@@ -355,7 +378,99 @@ def _match_flowers_and_calc(df, cost_map):
         | df['after_sale_status'].astype(str).str.contains('已发货|已收货', na=False, regex=True)
     )
 
-    return df, matched_count, unmatched_count
+    return df, matched_count, unmatched_count, unmatched_df
+
+
+# ============================
+# 「待建成本」辅助：未匹配订单单独汇总，避免营业额被静默过滤
+# ============================
+def _pending_cost_valid(unmatched_df):
+    """筛出「待建成本」有效销售（非退款、非取消）；返回 DataFrame 或 None。"""
+    if unmatched_df is None or unmatched_df.empty:
+        return None
+    um = unmatched_df[
+        (~unmatched_df['是否退款']) & (~unmatched_df['order_status'].isin(CANCELLED_STATUSES))
+    ].copy()
+    return um if not um.empty else None
+
+
+def append_pending_cost_rows(detail, unmatched_df):
+    """把「待建成本」订单追加到订单明细（花型='待建成本'，成本/盈利=0，营业额真实保留）。"""
+    um = _pending_cost_valid(unmatched_df)
+    if um is None:
+        return detail
+    pend = pd.DataFrame({
+        '花型': '待建成本',
+        '平台': um['平台'].values,
+        '成本': 0.0,
+        '米数': um['米数'].values,
+        '营业额': um['merchant_income'].values,
+        '快递费': 0.0,
+        '盈利': 0.0,
+        '售后状态': um['after_sale_status'].astype(str).values,
+        'order_no': um['order_no'].values,
+        '商品规格': um['product_spec'].astype(str).values,
+        '商品数量': um['product_quantity'].values,
+        '是否退款': False,
+    })
+    if '发货包号' in detail.columns:
+        pend['发货包号'] = um.apply(get_order_key, axis=1).values
+    if '成交日期' in detail.columns:
+        pend['成交日期'] = um['order_date'].values
+    common = [c for c in detail.columns if c in pend.columns]
+    if detail.empty:
+        return pend[common]
+    return pd.concat([detail, pend[common]], ignore_index=True)
+
+
+def append_pending_cost_summary(summary_wide, platform_summary, unmatched_df):
+    """把「待建成本」追加到花型汇总（一行）与平台汇总（每平台一行）。"""
+    um = _pending_cost_valid(unmatched_df)
+    if um is None:
+        return summary_wide, platform_summary
+    if not summary_wide.empty:
+        row = {'花型': '待建成本'}
+        for i, p in enumerate(SUMMARY_PLATFORMS):
+            sub = um[um['平台'] == p]
+            for m in SUMMARY_METRICS:
+                if m == '订单数':
+                    row[f'{p}_订单数'] = sub['order_no'].nunique() if not sub.empty else 0
+                elif m == '米数':
+                    row[f'{p}_米数'] = round(sub['米数'].sum(), 2) if not sub.empty else 0
+                elif m == '营业额':
+                    row[f'{p}_营业额'] = round(sub['merchant_income'].sum(), 2) if not sub.empty else 0
+                else:
+                    row[f'{p}_{m}'] = 0
+            row[f'_spacer_{i}_1'] = ''
+            row[f'_spacer_{i}_2'] = ''
+        for m in SUMMARY_METRICS:
+            if m == '订单数':
+                row[f'汇总_{m}'] = um['order_no'].nunique()
+            elif m == '米数':
+                row[f'汇总_{m}'] = round(um['米数'].sum(), 2)
+            elif m == '营业额':
+                row[f'汇总_{m}'] = round(um['merchant_income'].sum(), 2)
+            else:
+                row[f'汇总_{m}'] = 0
+        summary_wide = pd.concat([summary_wide, pd.DataFrame([row])], ignore_index=True)
+    if not platform_summary.empty:
+        extra = []
+        for p in SUMMARY_PLATFORMS:
+            sub = um[um['平台'] == p]
+            if sub.empty:
+                continue
+            extra.append({
+                '平台': f'{p}·待建成本',
+                '订单数': sub['order_no'].nunique(),
+                '成本': 0.0,
+                '米数': round(sub['米数'].sum(), 2),
+                '营业额': round(sub['merchant_income'].sum(), 2),
+                '快递费': 0.0,
+                '盈利': 0.0,
+            })
+        if extra:
+            platform_summary = pd.concat([platform_summary, pd.DataFrame(extra)], ignore_index=True)
+    return summary_wide, platform_summary
 
 
 # ============================
@@ -678,8 +793,10 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # ============================================================
     # 花型匹配 + 米数/成本/快递费/盈利 + 退款标记（共用函数，日报与区间报告口径一致）
     # ============================================================
-    df, matched_count, unmatched_count = _match_flowers_and_calc(df, cost_map)
+    df, matched_count, unmatched_count, unmatched_df = _match_flowers_and_calc(df, cost_map)
     if df is None:
+        if unmatched_count > 0:
+            print(f"⚠️ 另有 {unmatched_count} 条未匹配订单（待建成本）未纳入日报，请在成本表补建花型")
         print(f"❌ 没有匹配成功的订单，无法生成日报")
         return
 
@@ -715,6 +832,8 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
         'order_date': '成交日期'
     })
     detail = detail.sort_values('花型')
+    # 未匹配订单：追加「待建成本」明细，避免营业额被静默过滤
+    detail = append_pending_cost_rows(detail, unmatched_df)
 
     # ============================================================
     # 写入日报缓存
@@ -936,6 +1055,8 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # ============================================================
     summary_wide = build_platform_summary(normal_df)
     platform_summary = build_platform_totals(normal_df)
+    # 未匹配订单：追加「待建成本」汇总行，避免营业额被静默过滤
+    summary_wide, platform_summary = append_pending_cost_summary(summary_wide, platform_summary, unmatched_df)
 
 
 
@@ -967,7 +1088,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     if not normal_df.empty:
         print(f"📊 正常订单 {len(normal_df)} 单，总营业额 {normal_df['merchant_income'].sum():.2f}，总盈利 {normal_df['盈利'].sum():.2f}")
     if unmatched_count > 0:
-        print(f"⚠️ 已过滤 {unmatched_count} 条未匹配花型的订单")
+        print(f"⚠️ {unmatched_count} 条未匹配花型的订单已单独汇总为「待建成本」（明细与汇总末尾可见）")
     # ============================================================
     # 🆕 生成库存快照
     # ============================================================
@@ -1065,8 +1186,10 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
     print(f"📚 成本表中有 {len(cost_map)} 个花型（按 {end_date} 口径）")
 
     # 花型匹配 + 计算（与日报共用）
-    df, matched_count, unmatched_count = _match_flowers_and_calc(df, cost_map)
+    df, matched_count, unmatched_count, unmatched_df = _match_flowers_and_calc(df, cost_map)
     if df is None:
+        if unmatched_count > 0:
+            print(f"⚠️ 另有 {unmatched_count} 条未匹配订单（待建成本）未纳入区间报告，请在成本表补建花型")
         print("❌ 区间内没有匹配成功的订单")
         return None
 
@@ -1094,10 +1217,14 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
         'order_date': '成交日期'
     })
     detail = detail.sort_values('花型')
+    # 未匹配订单：追加「待建成本」明细，避免营业额被静默过滤
+    detail = append_pending_cost_rows(detail, unmatched_df)
 
     # 汇总表
     summary_wide = build_platform_summary(normal_df)
     platform_summary = build_platform_totals(normal_df)
+    # 未匹配订单：追加「待建成本」汇总行，避免营业额被静默过滤
+    summary_wide, platform_summary = append_pending_cost_summary(summary_wide, platform_summary, unmatched_df)
 
     if not normal_df.empty:
         print(f"📊 正常订单 {len(normal_df)} 单 / 营业额 {normal_df['merchant_income'].sum():.2f} / 盈利 {normal_df['盈利'].sum():.2f}")

@@ -538,7 +538,7 @@ class TestShippingFee:
             'parent_order_no': [None, None, 'DY1', 'DY1', 'DY1', None],
             'postage': [0.0, 0.0, 5.0, 5.0, 5.0, 0.0],
         })
-        df, matched, _ = _match_flowers_and_calc(order_df, {'花型A': 10.0})
+        df, matched, _, _ = _match_flowers_and_calc(order_df, {'花型A': 10.0})
         assert matched == 6
         by_no = df.set_index('order_no')
         # 拼多多 A1/A2 同一快递单号 SF001 → 1 份，postage=0 → 固定 2.5，只记首行

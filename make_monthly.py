@@ -875,6 +875,22 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
 
 
 
+    # 未匹配订单：标为「待建成本」，成本/盈利=0，营业额真实保留（进报表单独汇总）
+    unmatched_df = df[df['花型'] == '未匹配'].copy()
+    if not unmatched_df.empty:
+        unmatched_df['花型'] = '待建成本'
+        unmatched_df['平台'] = unmatched_df['platform'].map(PLATFORM_NAMES).fillna('拼多多')
+        unmatched_df['单位米数'] = unmatched_df['product_spec'].apply(extract_meter_from_spec)
+        unmatched_df.loc[unmatched_df['单位米数'] == 0, '单位米数'] = 1
+        unmatched_df['米数'] = (unmatched_df['单位米数'] * unmatched_df['product_quantity']).round(2)
+        unmatched_df['成本'] = 0.0
+        unmatched_df['快递费'] = 0.0
+        unmatched_df['盈利'] = 0.0
+        unmatched_df['是否退款'] = (
+            unmatched_df['after_sale_status'].astype(str).str.contains('退款成功', na=False)
+            | unmatched_df['order_status'].astype(str).str.contains('退款成功', na=False)
+        )
+
     # ==========================================================
     # 过滤未匹配订单
     # ==========================================================
@@ -1120,6 +1136,10 @@ def generate_monthly_report(start_date,end_date,force=False,orders=orders):
 
     summary_wide = build_platform_summary(normal_df, total_label="【月度总计】")
     platform_summary = build_platform_totals(normal_df)
+    # 未匹配订单：追加「待建成本」汇总/明细，避免营业额被静默过滤
+    from make_daily import append_pending_cost_rows, append_pending_cost_summary
+    detail = append_pending_cost_rows(detail, unmatched_df)
+    summary_wide, platform_summary = append_pending_cost_summary(summary_wide, platform_summary, unmatched_df)
 
 
 

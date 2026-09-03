@@ -239,6 +239,16 @@ elif menu == "📤 导入订单":
                 st.success(regen_msg)
             st.success(f"✅ {import_result['message']}")
 
+            # 🔧 新商品未建档提示（未匹配到成本表花型，将单独汇总为「待建成本」）
+            _pending = (import_result.get("stats") or {}).get("待建档新商品")
+            if _pending:
+                st.warning(
+                    f"⚠️ 本次导入有 {len(_pending)} 个商品未在成本表建档，"
+                    f"这些订单在日报/区间/月报中会单独汇总为「待建成本」（营业额不遗漏）。"
+                    f"请到花型管理补建成本后重新生成日报即可归位："
+                )
+                st.json(_pending)
+
             # 📅 导入后自动重新生成受影响日期的日报（未生成过的日期也会 force 生成）
             affected_dates = import_result.get("affected_dates") or []
             if affected_dates and not st.session_state.get("import_auto_regen_done", False):
