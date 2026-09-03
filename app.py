@@ -683,6 +683,26 @@ elif menu == "🚨 预警中心":
 elif menu == "📊 报告生成":
     st.header("📊 报告生成")
 
+    def _show_unmatched_warning(report_name):
+        """生成后提示未匹配花型订单（不写入报表，仅在页面显示）。"""
+        try:
+            import make_daily
+            um = getattr(make_daily, "LAST_UNMATCHED", None) or {}
+            count = um.get("count", 0)
+            if count <= 0:
+                return
+            products = um.get("products", {})
+            prod_txt = "、".join(f"{k}（{v}条）" for k, v in list(products.items())[:10])
+            if len(products) > 10:
+                prod_txt += f" 等共 {len(products)} 个商品"
+            st.warning(
+                f"⚠️ 本次{report_name}有 {count} 条订单未匹配到成本表花型"
+                f"（营业额 {um.get('amount', 0):.2f} 元，未计入报表），"
+                f"请在花型管理补建成本后重新生成即可归位：{prod_txt}"
+            )
+        except Exception:
+            pass
+
     # ---------- 在线生成日报 ----------
     st.subheader("📝 生成日报")
     st.info("💡 每次生成都会强制覆盖已有日报，先回退旧库存，再基于最新订单数据重新扣减")
@@ -698,6 +718,7 @@ elif menu == "📊 报告生成":
                 filepath = generate_daily_report(date_str, force=True)
                 if filepath and os.path.exists(filepath):
                     st.success(f"✅ {date_str} 日报生成成功！")
+                    _show_unmatched_warning("日报")
                     # 提供下载按钮
                     with open(filepath, "rb") as f:
                         st.download_button(
@@ -733,6 +754,7 @@ elif menu == "📊 报告生成":
                 filepath = generate_range_report(start_str, end_str, force=True)
                 if filepath and os.path.exists(filepath):
                     st.success("✅ 区间报告生成成功！")
+                    _show_unmatched_warning("区间报告")
                     with open(filepath, "rb") as f:
                         st.download_button(
                             label="📥 下载区间报告 Excel",
