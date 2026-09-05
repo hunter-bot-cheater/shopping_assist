@@ -1318,6 +1318,51 @@ elif menu == "🌸 花型管理":
 
     st.divider()
 
+    # ============= 修改花型名称 / 成本 =============
+    st.subheader("✏️ 修改花型名称 / 成本")
+    from add_del_flower import update_flower
+    edit_flowers_df = get_all_flowers(include_deleted=True)
+    if edit_flowers_df.empty:
+        st.info("暂无花型数据")
+    else:
+        edit_names = edit_flowers_df['flower'].tolist()
+        col_e1, col_e2 = st.columns([2, 1])
+        with col_e1:
+            edit_target = st.selectbox(
+                "选择花型",
+                options=edit_names,
+                index=None,
+                placeholder="请选择要修改的花型...",
+                key="edit_flower_target"
+            )
+        if edit_target:
+            cur_row = edit_flowers_df[edit_flowers_df['flower'] == edit_target].iloc[0]
+            cur_cost = float(cur_row['cost_per_meter'])
+            deleted_note = "（已删除花型）" if cur_row['is_deleted'] == 1 else ""
+            st.info(f"当前：花型「{edit_target}」{deleted_note}，成本 {cur_cost:.2f} 元/米")
+            with st.form("edit_flower_form"):
+                col_n1, col_n2 = st.columns(2)
+                with col_n1:
+                    new_name = st.text_input("新名称（默认=不改名）", value=edit_target)
+                with col_n2:
+                    new_cost = st.number_input(
+                        "新成本单价（元/米）", min_value=0.0, step=0.1,
+                        format="%.2f", value=cur_cost
+                    )
+                submitted_edit = st.form_submit_button("💾 确认修改", type="primary")
+            if submitted_edit:
+                success, msg = update_flower(edit_target, new_name, new_cost, "admin")
+                if success:
+                    st.success(msg)
+                    st.cache_data.clear()
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(msg)
+        st.caption("💡 改名会级联更新所有关联数据（库存/快照/流水/退款明细/日报缓存等）；改成本后重新生成日报/区间/月报即按新成本计算")
+
+    st.divider()
+
     # ============= 底部：花型列表 =============
     st.subheader("📋 花型列表")
     flowers_df = get_all_flowers(include_deleted=True)

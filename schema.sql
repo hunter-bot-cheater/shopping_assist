@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS inventory (
 CREATE TABLE IF NOT EXISTS inventory_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     flower VARCHAR(100),
-    change_type ENUM('初始化','入库','销售出库','报损','盘点调整','手动调整'),
+    change_type ENUM('初始化','入库','销售出库','报损','盘点调整','手动调整','新增花型','删除花型','恢复花型','修改花型'),
     change_qty DECIMAL(10,2),
     before_stock DECIMAL(10,2),
     after_stock DECIMAL(10,2),
@@ -214,7 +214,8 @@ MODIFY COLUMN change_type ENUM(
     '手动调整',
     '新增花型',
     '删除花型',
-    '恢复花型'
+    '恢复花型',
+    '修改花型'
 ) NULL DEFAULT NULL;
 
 ALTER TABLE product_cost
