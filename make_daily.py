@@ -33,6 +33,18 @@ def ensure_output_dir():
         os.makedirs(OUTPUT_DIR)
 
 
+def get_range_output_dir():
+    """区间报告输出目录：优先读 config.py 的 OUTPUT_DIR_range_report（每台机器可单独配置，
+    如远程 G:/shopping_assist/区间报告）；未配置或值不是有效字符串时与日报同目录，保持原有行为。"""
+    try:
+        from config import OUTPUT_DIR_range_report
+        if isinstance(OUTPUT_DIR_range_report, str) and OUTPUT_DIR_range_report.strip():
+            return OUTPUT_DIR_range_report
+    except (ImportError, AttributeError):
+        pass
+    return OUTPUT_DIR
+
+
 def extract_meter_from_spec(spec):
     """提取购买米数（只识别逗号前的长度，避免把宽幅识别进去）"""
     if pd.isna(spec):
@@ -231,7 +243,9 @@ def get_order_key(row):
 def _match_flowers_and_calc(df, cost_map):
     """花型四层匹配 + 米数/成本/快递费/盈利 + 退款标记 + 平台名。
 
-    返回 (df, matched_count, unmatched_count)；无匹配订单时 df 为 None。
+    返回 (df, matched_count, unmatched_count, unmatched_df)；
+    df 为匹配成功订单（进入汇总/库存/缓存）；unmatched_df 为未匹配订单
+    （成本/盈利=0，营业额真实保留，仅生成时在页面提示，不写入报表、不进库存）。
     """
     cost_flowers = set(cost_map.keys())
     df = assign_flowers(df, cost_flowers)
@@ -240,7 +254,7 @@ def _match_flowers_and_calc(df, cost_map):
     final_unmatched = df[df['花型'] == '未匹配']
     if not final_unmatched.empty:
         print("\n" + "=" * 80)
-        print("🚫 所有匹配策略均未成功的订单明细（已从日报中过滤，请人工核查）：")
+        print("🚫 以下订单未匹配到成本表花型，未计入报表，仅提示（补建成本后重新生成即可归位）：")
         print("-" * 80)
         print(final_unmatched[['order_no', 'product', 'product_spec']].to_string(index=False))
         print("=" * 80 + "\n")
@@ -253,10 +267,31 @@ def _match_flowers_and_calc(df, cost_map):
     unmatched_count = len(unmatched_df)
     print(f"✅ 匹配成功: {matched_count} 条")
     if unmatched_count > 0:
-        print(f"⚠️ 未匹配（将被过滤）: {unmatched_count} 条")
+        print(f"⚠️ 未匹配（仅提示，不写入报表）: {unmatched_count} 条")
+
+    # 未匹配订单：标为「待建成本」，成本/快递费/盈利未知置 0（营业额与米数真实保留）
+    if not unmatched_df.empty:
+        unmatched_df['花型'] = '待建成本'
+        unmatched_df['平台'] = unmatched_df['platform'].map(PLATFORM_NAMES).fillna('拼多多')
+        unmatched_df['单位米数'] = unmatched_df['product_spec'].apply(extract_meter_from_spec)
+        unmatched_df.loc[unmatched_df['单位米数'] == 0, '单位米数'] = 1
+        unmatched_df['米数'] = (
+            (unmatched_df['单位米数'] * unmatched_df['product_quantity'] * 2).round() / 2
+        ).round(2)
+        unmatched_df['成本'] = 0.0
+        unmatched_df['快递费'] = 0.0
+        unmatched_df['盈利'] = 0.0
+        unmatched_df['是否退款'] = (
+            unmatched_df['after_sale_status'].astype(str).str.contains('退款成功', na=False)
+            | unmatched_df['order_status'].astype(str).str.contains('退款成功', na=False)
+        )
+        unmatched_df['发货退款'] = unmatched_df['是否退款'] & (
+            unmatched_df['order_status'].astype(str).str.contains('已发货|已收货', na=False, regex=True)
+            | unmatched_df['after_sale_status'].astype(str).str.contains('已发货|已收货', na=False, regex=True)
+        )
 
     if matched_df.empty:
-        return None, matched_count, unmatched_count
+        return None, matched_count, unmatched_count, unmatched_df
 
     df = matched_df
 
@@ -330,9 +365,50 @@ def _match_flowers_and_calc(df, cost_map):
     # ============================================================
     # 退款标记
     # ============================================================
-    df['是否退款'] = df['after_sale_status'].astype(str).str.contains('退款成功', na=False)
+    # 退款标记：售后状态 或 订单状态 含「退款成功」都算退款
+    # （拼多多退款标记在订单状态如「已发货，退款成功」+ 售后状态「退款成功」；
+    #   淘宝/抖音退款标记合成在售后状态如「已发货，退款成功」，订单状态为「交易关闭/已关闭」）
+    df['是否退款'] = (
+        df['after_sale_status'].astype(str).str.contains('退款成功', na=False)
+        | df['order_status'].astype(str).str.contains('退款成功', na=False)
+    )
+    # 已发货/已收货 且 退款成功（对账明细保留，涉及运费承担）；已发货/已收货标记可能在任一字段
+    df['发货退款'] = df['是否退款'] & (
+        df['order_status'].astype(str).str.contains('已发货|已收货', na=False, regex=True)
+        | df['after_sale_status'].astype(str).str.contains('已发货|已收货', na=False, regex=True)
+    )
 
-    return df, matched_count, unmatched_count
+    return df, matched_count, unmatched_count, unmatched_df
+
+
+# ============================
+# 未匹配订单：生成时页面提示（不写入报表 Excel）
+# ============================
+# 最近一次生成报告的未匹配订单摘要，供 app.py 生成后在页面上提示
+LAST_UNMATCHED = {"count": 0, "amount": 0.0, "products": {}, "orders": []}
+
+
+def _pending_cost_valid(unmatched_df):
+    """筛出未匹配且有效的销售（非退款、非取消）；返回 DataFrame 或 None。"""
+    if unmatched_df is None or unmatched_df.empty:
+        return None
+    um = unmatched_df[
+        (~unmatched_df['是否退款']) & (~unmatched_df['order_status'].isin(CANCELLED_STATUSES))
+    ].copy()
+    return um if not um.empty else None
+
+
+def _unmatched_summary(unmatched_df):
+    """生成未匹配订单摘要（供页面提示；不写入报表 Excel）。"""
+    um = _pending_cost_valid(unmatched_df)
+    if um is None:
+        return {"count": 0, "amount": 0.0, "products": {}, "orders": []}
+    return {
+        "count": len(um),
+        "amount": round(float(um['merchant_income'].sum()), 2),
+        "products": um['product'].fillna('(空商品)').value_counts().to_dict(),
+        "orders": um['order_no'].tolist(),
+    }
 
 
 # ============================
@@ -655,8 +731,10 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     # ============================================================
     # 花型匹配 + 米数/成本/快递费/盈利 + 退款标记（共用函数，日报与区间报告口径一致）
     # ============================================================
-    df, matched_count, unmatched_count = _match_flowers_and_calc(df, cost_map)
+    df, matched_count, unmatched_count, unmatched_df = _match_flowers_and_calc(df, cost_map)
     if df is None:
+        if unmatched_count > 0:
+            print(f"⚠️ 另有 {unmatched_count} 条未匹配订单（待建成本）未纳入日报，请在成本表补建花型")
         print(f"❌ 没有匹配成功的订单，无法生成日报")
         return
 
@@ -667,20 +745,12 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
 
     # ============================================================
     # 明细表数据：正常订单 + 已发货/已收货退款订单（用于对账/运费核算）
+    # 已发货/已收货退款标记可能在订单状态或售后状态任一字段（淘宝/抖音合成在售后状态，
+    # 订单状态为「交易关闭/已关闭」），用统一的「发货退款」标记判断，避免漏掉
     # ============================================================
-    # 需要保留的退款状态（涉及运费承担）
-    keep_refund_statuses = [
-        '已发货，退款成功',
-        '已收货，退款成功'
-    ]
-
-    # 明细表数据：正常订单 + 符合条件的退款订单
     detail_df = df[
-        (~df['order_status'].isin(CANCELLED_STATUSES)) &
-        (
-                (~df['是否退款']) |
-                (df['order_status'].isin(keep_refund_statuses))
-        )
+        ((~df['order_status'].isin(CANCELLED_STATUSES)) & (~df['是否退款']))
+        | df['发货退款']
         ].copy()
 
     # 退款订单的成本和米数设为 0
@@ -700,6 +770,9 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
         'order_date': '成交日期'
     })
     detail = detail.sort_values('花型')
+    # 未匹配订单：记录摘要供页面提示（不写入报表）
+    LAST_UNMATCHED.clear()
+    LAST_UNMATCHED.update(_unmatched_summary(unmatched_df))
 
     # ============================================================
     # 写入日报缓存
@@ -952,7 +1025,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
     if not normal_df.empty:
         print(f"📊 正常订单 {len(normal_df)} 单，总营业额 {normal_df['merchant_income'].sum():.2f}，总盈利 {normal_df['盈利'].sum():.2f}")
     if unmatched_count > 0:
-        print(f"⚠️ 已过滤 {unmatched_count} 条未匹配花型的订单")
+        print(f"⚠️ {unmatched_count} 条未匹配花型的订单未计入报表（补建成本后重新生成即可归位）")
     # ============================================================
     # 🆕 生成库存快照
     # ============================================================
@@ -988,7 +1061,10 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
     仅排除退款订单与已取消/已关闭订单。
     文件名：区间报告_YYYYMMDD-YYYYMMDD.xlsx
     """
-    ensure_output_dir()
+    # 区间报告输出目录（可在每台机器 config.py 单独配置）
+    _range_dir = get_range_output_dir()
+    if not os.path.exists(_range_dir):
+        os.makedirs(_range_dir)
 
     try:
         start_dt = datetime.strptime(start_date, '%Y-%m-%d')
@@ -1004,11 +1080,7 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
     start_date = start_dt.strftime('%Y-%m-%d')
     end_date = end_dt.strftime('%Y-%m-%d')
     filename = f"区间报告_{start_dt.strftime('%Y%m%d')}-{end_dt.strftime('%Y%m%d')}.xlsx"
-    filepath = os.path.join(OUTPUT_DIR, filename)
-
-    if os.path.exists(filepath) and not force:
-        print(f"⏭️ {filename} 已存在，跳过生成")
-        return filepath
+    filepath = os.path.join(_range_dir, filename)
 
     # ============================================================
     # 读取区间订单（按下单日期统计：拼多多订单号前6位 / 淘宝订单付款时间 / 抖音订单完成时间）
@@ -1051,8 +1123,10 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
     print(f"📚 成本表中有 {len(cost_map)} 个花型（按 {end_date} 口径）")
 
     # 花型匹配 + 计算（与日报共用）
-    df, matched_count, unmatched_count = _match_flowers_and_calc(df, cost_map)
+    df, matched_count, unmatched_count, unmatched_df = _match_flowers_and_calc(df, cost_map)
     if df is None:
+        if unmatched_count > 0:
+            print(f"⚠️ 另有 {unmatched_count} 条未匹配订单（待建成本）未纳入区间报告，请在成本表补建花型")
         print("❌ 区间内没有匹配成功的订单")
         return None
 
@@ -1061,16 +1135,10 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
     # ============================================================
     normal_df = df[(~df['是否退款']) & (~df['order_status'].isin(CANCELLED_STATUSES))]
 
-    keep_refund_statuses = [
-        '已发货，退款成功',
-        '已收货，退款成功'
-    ]
+    # 明细：正常订单 + 已发货/已收货退款订单（发货退款标记在订单状态或售后状态任一字段）
     detail_df = df[
-        (~df['order_status'].isin(CANCELLED_STATUSES)) &
-        (
-                (~df['是否退款']) |
-                (df['order_status'].isin(keep_refund_statuses))
-        )
+        ((~df['order_status'].isin(CANCELLED_STATUSES)) & (~df['是否退款']))
+        | df['发货退款']
         ].copy()
     detail_df.loc[detail_df['是否退款'] == True, ['成本', '米数']] = 0
 
@@ -1086,6 +1154,9 @@ def generate_range_report(start_date, end_date, force=True, orders=orders):
         'order_date': '成交日期'
     })
     detail = detail.sort_values('花型')
+    # 未匹配订单：记录摘要供页面提示（不写入报表）
+    LAST_UNMATCHED.clear()
+    LAST_UNMATCHED.update(_unmatched_summary(unmatched_df))
 
     # 汇总表
     summary_wide = build_platform_summary(normal_df)

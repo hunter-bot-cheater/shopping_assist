@@ -315,6 +315,28 @@ def ensure_parent_order_no_column():
 # ============================
 # 主导入函数（改为 UPSERT）
 # ============================
+def _detect_unmatched_products(df):
+    """检测导入订单中未匹配到成本表花型的商品（新商品未建档提示）。
+
+    与日报/区间/月报同一套 assign_flowers 匹配口径；返回 {商品名: 行数}。
+    仅提示，不影响导入本身。
+    """
+    try:
+        from make_daily import assign_flowers, load_cost_map
+        cost_map = load_cost_map()
+        if not cost_map or df is None or df.empty or 'product' not in df.columns:
+            return {}
+        small = df[['product', 'product_spec']].copy()
+        small = assign_flowers(small, set(cost_map.keys()))
+        unmatched = small[small['花型'] == '未匹配']
+        if unmatched.empty:
+            return {}
+        return unmatched['product'].fillna('(空商品)').value_counts().to_dict()
+    except Exception as e:
+        print(f"⚠️ 新商品建档检测失败：{e}")
+        return {}
+
+
 def import_excel(file_path=None):
     """
     导入订单明细Excel到MySQL，使用 UPSERT（重复则更新）
@@ -511,10 +533,16 @@ def import_excel(file_path=None):
             else:
                 print("ℹ️ 导入数据中没有有效的下单日期")
 
+        _pending = _detect_unmatched_products(df)
+        _stats = {"总行数": len(df), "成功导入": len(df)}
+        _message = f"成功导入 {len(df)} 条数据到 {orders} 表"
+        if _pending:
+            _stats["待建档新商品"] = _pending
+            _message += f"；⚠️ {len(_pending)} 个商品未在成本表建档，将单独汇总为「待建成本」"
         return {
             "success": True,
-            "message": f"成功导入 {len(df)} 条数据到 {orders} 表",
-            "stats": {"总行数": len(df), "成功导入": len(df)}
+            "message": _message,
+            "stats": _stats
         }
     except Exception as e:
         return {
@@ -924,9 +952,14 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
                         d = row[0]
                         affected_dates.add(d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d))
 
+        _pending = _detect_unmatched_products(df)
+        _message = f"成功导入 {total} 条数据到 {orders} 表"
+        if _pending:
+            stats["待建档新商品"] = _pending
+            _message += f"；⚠️ {len(_pending)} 个商品未在成本表建档，将单独汇总为「待建成本」"
         return {
             "success": True,
-            "message": f"成功导入 {total} 条数据到 {orders} 表",
+            "message": _message,
             "stats": stats,
             "changes": changes,
             "affected_dates": sorted(affected_dates),

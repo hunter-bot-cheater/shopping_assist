@@ -53,30 +53,52 @@ def _backfill_status_label(conn):
 
 
 def sync_refund_details(cost_map=None):
+    """同步退款明细：只保留「已发货/已收货 退款成功」，未发货退款成功不入明细。
+    返回结果字典：{cleaned, backfilled, found, synced, excluded_undelivered, errors}，
+    供页面展示详细结果与逐单错误。
+    """
     print("📋 正在同步退款明细...")
+    result = {
+        'cleaned': 0,
+        'backfilled': 0,
+        'found': 0,
+        'synced': 0,
+        'excluded_undelivered': 0,
+        'errors': [],
+    }
 
     with engine.connect() as conn:
-        # ① 先清理历史脏数据：refund_detail 里现存但源订单不满足「已发货/已收货 退款成功」的记录
-        # 依据：以 data2026 当前状态为准，反查 order_no+flower+spec 不再符合条件的退款明细
+        # ① 先清理：① 订单表中已不存在该订单的残留 ② 现存但源订单不再满足「已发货/已收货 退款成功」的记录
+        # 依据：以 data2026 当前状态为准；已发货/已收货标记可能在订单状态或售后状态任一字段
+        #（淘宝/抖音合成在售后状态如「已发货，退款成功」，订单状态为「交易关闭/已关闭」）
         cleanup = conn.execute(text("""
             DELETE r FROM refund_detail r
-            INNER JOIN data2026 d ON r.order_no = d.order_no
-            WHERE NOT (
-                (d.order_status LIKE '%已发货%' OR d.order_status LIKE '%已收货%')
-                AND d.after_sale_status LIKE '%退款成功%'
-                AND d.after_sale_status NOT LIKE '%未发货%'
-            )
+            LEFT JOIN data2026 d ON r.order_no = d.order_no
+            WHERE d.order_no IS NULL
+               OR NOT (
+                    (d.order_status LIKE '%已发货%' OR d.order_status LIKE '%已收货%'
+                     OR d.after_sale_status LIKE '%已发货%' OR d.after_sale_status LIKE '%已收货%')
+                    AND d.after_sale_status LIKE '%退款成功%'
+                    AND d.after_sale_status NOT LIKE '%未发货%'
+               )
         """))
-        cleaned = cleanup.rowcount or 0
-        if cleaned:
-            print(f"🧹 已清理 {cleaned} 条历史脏数据（非「已发货/已收货 退款成功」）")
+        result['cleaned'] = cleanup.rowcount or 0
+        if result['cleaned']:
+            print(f"🧹 已清理 {result['cleaned']} 条（孤立残留或非「已发货/已收货 退款成功」）")
 
         # ② 把历史「仅退款成功」无前缀的记录，按 data2026 当前 order_status 补齐前缀
-        backfilled = _backfill_status_label(conn)
-        if backfilled:
-            print(f"✏️ 已重写 {backfilled} 条历史「售后状态」为「已发货/已收货 + 退款成功」格式")
+        result['backfilled'] = _backfill_status_label(conn)
+        if result['backfilled']:
+            print(f"✏️ 已重写 {result['backfilled']} 条历史「售后状态」")
 
-        # ③ 查询已发货/已收货 且 退款成功 且 非未发货 的订单
+        # ③ 统计「未发货退款成功」（不入明细，仅说明性展示）
+        result['excluded_undelivered'] = conn.execute(text("""
+            SELECT COUNT(*) FROM data2026
+            WHERE after_sale_status LIKE '%退款成功%'
+              AND (order_status LIKE '%未发货%' OR after_sale_status LIKE '%未发货%')
+        """)).fetchone()[0]
+
+        # ④ 查询已发货/已收货 且 退款成功 且 非未发货 的订单
         df = pd.read_sql(
             text("""
                 SELECT
@@ -89,16 +111,18 @@ def sync_refund_details(cost_map=None):
                     after_sale_status,
                     order_time
                 FROM data2026
-                WHERE (order_status LIKE '%已发货%' OR order_status LIKE '%已收货%')
+                WHERE (order_status LIKE '%已发货%' OR order_status LIKE '%已收货%'
+                       OR after_sale_status LIKE '%已发货%' OR after_sale_status LIKE '%已收货%')
                   AND after_sale_status LIKE '%退款成功%'
                   AND after_sale_status NOT LIKE '%未发货%'
             """),
             conn
         )
+        result['found'] = len(df)
 
         if df.empty:
             print("✅ 没有符合条件的退款订单需要同步")
-            return
+            return result
 
         print(f"📦 找到 {len(df)} 条退款记录")
 
@@ -133,7 +157,7 @@ def sync_refund_details(cost_map=None):
             axis=1
         )
 
-        total = 0
+        # 逐单写入（保存点隔离：单条失败只回滚该条并记录，不影响其它正常写入）
         for _, row in grouped.iterrows():
             sql = text("""
                 INSERT INTO refund_detail
@@ -148,7 +172,7 @@ def sync_refund_details(cost_map=None):
                     after_sale_status = VALUES(after_sale_status),
                     refund_time = VALUES(refund_time)
             """)
-            conn.execute(sql, {
+            params = {
                 "order_no": row['order_no'],
                 "flower": row['花型'],
                 "spec": row['product_spec'],
@@ -157,11 +181,18 @@ def sync_refund_details(cost_map=None):
                 "amount": float(row['refund_amount']),
                 "status": row['after_sale_status'],
                 "time": row['order_time']  # 已转为 None 或有效时间
-            })
-            total += 1
+            }
+            try:
+                with conn.begin_nested():
+                    conn.execute(sql, params)
+                result['synced'] += 1
+            except Exception as e:
+                result['errors'].append((row['order_no'], str(e)))
+                print(f"⚠️ 订单 {row['order_no']} 同步失败: {e}")
 
         conn.commit()
-        print(f"✅ 同步完成：共 {total} 条退款明细")
+        print(f"✅ 同步完成：写入 {result['synced']} 条，出错 {len(result['errors'])} 条")
+        return result
 
 if __name__ == "__main__":
     sync_refund_details()

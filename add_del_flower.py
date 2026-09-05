@@ -308,3 +308,115 @@ def restore_flower(flower_name, operator="system"):
         except Exception as e:
             trans.rollback()
             return (False, f"❌ 恢复失败：{str(e)}")
+
+# =============================================
+# 5. 修改花型（名称 / 成本）
+# =============================================
+# 花型名称是跨表关联键，改名必须级联更新所有存 flower 的表：
+# product_cost / inventory / inventory_base / inventory_snapshot /
+# inventory_log / inventory_change_log / daily_report_cache /
+# refund_detail / inventory_shortfall
+_FLOWER_LINKED_TABLES = [
+    'product_cost', 'inventory', 'inventory_base', 'inventory_snapshot',
+    'inventory_log', 'inventory_change_log', 'daily_report_cache',
+    'refund_detail', 'inventory_shortfall',
+]
+
+
+def update_flower(old_name, new_name=None, new_cost=None, operator="system"):
+    """修改花型名称和/或成本单价，全程一个事务。
+
+    - 改名：级联更新全部关联表，并检查新名称不与其他花型冲突
+    - 改成本：只更新 product_cost.cost_per_meter（重新生成日报/区间/月报即生效）
+    - 写 inventory_log 流水；成功消息附带匹配提醒（商品名不再包含新名称的订单
+      重新生成时可能变未匹配）
+    返回 (成功/失败, 消息)
+    """
+    old_name = (old_name or "").strip()
+    if not old_name:
+        return (False, "请选择要修改的花型")
+    new_name = (new_name or "").strip()
+    has_name_change = bool(new_name) and new_name != old_name
+    if not has_name_change and new_cost is None:
+        return (False, "没有需要修改的内容（名称或成本都未变化）")
+
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            row = conn.execute(
+                text("SELECT flower, cost_per_meter, is_deleted FROM product_cost WHERE flower = :f"),
+                {"f": old_name}
+            ).fetchone()
+            if not row:
+                return (False, f"❌ 花型「{old_name}」不存在")
+            old_cost = float(row[1])
+            new_cost_f = float(new_cost) if new_cost is not None else old_cost
+            has_cost_change = abs(new_cost_f - old_cost) >= 1e-9
+            if not has_name_change and not has_cost_change:
+                return (False, "没有需要修改的内容（名称或成本都未变化）")
+
+            # 1. 改名冲突检查（含已删除花型，避免主键/关联混乱）
+            if has_name_change:
+                conflict = conn.execute(
+                    text("SELECT 1 FROM product_cost WHERE flower = :n"),
+                    {"n": new_name}
+                ).fetchone()
+                if conflict:
+                    return (False, f"❌ 花型「{new_name}」已存在，无法重命名")
+
+            # 2. 级联改名（全部关联表）
+            if has_name_change:
+                for tbl in _FLOWER_LINKED_TABLES:
+                    conn.execute(
+                        text(f"UPDATE {tbl} SET flower = :n WHERE flower = :o"),
+                        {"n": new_name, "o": old_name}
+                    )
+
+            # 3. 改成本
+            final_name = new_name if has_name_change else old_name
+            if has_cost_change:
+                conn.execute(
+                    text("""
+                        UPDATE product_cost
+                        SET cost_per_meter = :c, update_time = NOW()
+                        WHERE flower = :f
+                    """),
+                    {"c": new_cost_f, "f": final_name}
+                )
+
+            # 4. 流水
+            changes = []
+            if has_name_change:
+                changes.append(f"名称 {old_name} → {new_name}")
+            if has_cost_change:
+                changes.append(f"成本 {old_cost:g} → {new_cost_f:g} 元/米")
+            conn.execute(
+                text("""
+                    INSERT INTO inventory_log
+                    (flower, change_type, change_qty, before_stock, after_stock, reference, operator)
+                    VALUES (:f, '修改花型', 0, 0, 0, :ref, :op)
+                """),
+                {"f": final_name, "ref": ("；".join(changes))[:50], "op": operator}
+            )
+
+            # 5. 匹配提醒：改名后商品名仍包含新名称的订单数对比
+            hint = ""
+            if has_name_change:
+                old_cnt = conn.execute(
+                    text("SELECT COUNT(*) FROM data2026 WHERE product LIKE :p"),
+                    {"p": f"%{old_name}%"}
+                ).scalar()
+                new_cnt = conn.execute(
+                    text("SELECT COUNT(*) FROM data2026 WHERE product LIKE :p"),
+                    {"p": f"%{new_name}%"}
+                ).scalar()
+                if new_cnt < old_cnt:
+                    hint = (f"；注意：有 {old_cnt} 条历史订单商品名含旧名称，"
+                            f"其中仅 {new_cnt} 条含新名称，重新生成日报时可能部分变为未匹配，"
+                            f"请核对后重新生成受影响日报")
+
+            trans.commit()
+            return (True, f"✅ 花型修改成功：{'；'.join(changes)}{hint}")
+        except Exception as e:
+            trans.rollback()
+            return (False, f"❌ 修改失败：{str(e)}")

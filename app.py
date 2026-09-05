@@ -21,6 +21,7 @@ from add_del_flower import (
 import time
 from sqlalchemy import text
 from mysql_conn import engine
+from report_date_logic import ORDER_DATE_SQL
 # ============================
 # 辅助函数：获取花型列表（供下拉选择用）
 # ============================
@@ -238,6 +239,16 @@ elif menu == "📤 导入订单":
                 st.success(regen_msg)
             st.success(f"✅ {import_result['message']}")
 
+            # 🔧 新商品未建档提示（未匹配到成本表花型，将单独汇总为「待建成本」）
+            _pending = (import_result.get("stats") or {}).get("待建档新商品")
+            if _pending:
+                st.warning(
+                    f"⚠️ 本次导入有 {len(_pending)} 个商品未在成本表建档，"
+                    f"这些订单在日报/区间/月报中会单独汇总为「待建成本」（营业额不遗漏）。"
+                    f"请到花型管理补建成本后重新生成日报即可归位："
+                )
+                st.json(_pending)
+
             # 📅 导入后自动重新生成受影响日期的日报（未生成过的日期也会 force 生成）
             affected_dates = import_result.get("affected_dates") or []
             if affected_dates and not st.session_state.get("import_auto_regen_done", False):
@@ -350,7 +361,7 @@ elif menu == "📥 入库登记":
             )
             qty = st.number_input("入库米数 *", min_value=0.5, step=0.5, format="%.1f")
         with col2:
-            stock_date = st.date_input("入库日期", value=date.today(), help="入库生效日期，该日期及之后的库存都会增加")
+            stock_date = st.date_input("入库日期", value=date.today(), key="stock_date_key", help="入库生效日期，该日期及之后的库存都会增加")
             ref = st.text_input("备注", placeholder="例：2026-07-25 第一批进货")
             operator = st.text_input("操作人", value="admin")
 
@@ -402,7 +413,7 @@ elif menu == "📤 出库登记":
             )
             qty = st.number_input("出库米数 *", min_value=0.5, step=0.5, format="%.1f")
         with col2:
-            ref_date = st.date_input("销售日期", value=date.today(), help="出库日期，该日期及之后的库存都会减少")
+            ref_date = st.date_input("销售日期", value=date.today(), key="ref_date_key", help="出库日期，该日期及之后的库存都会减少")
             operator = st.text_input("操作人", value="admin")
 
         submitted = st.form_submit_button("✅ 确认出库")
@@ -672,11 +683,31 @@ elif menu == "🚨 预警中心":
 elif menu == "📊 报告生成":
     st.header("📊 报告生成")
 
+    def _show_unmatched_warning(report_name):
+        """生成后提示未匹配花型订单（不写入报表，仅在页面显示）。"""
+        try:
+            import make_daily
+            um = getattr(make_daily, "LAST_UNMATCHED", None) or {}
+            count = um.get("count", 0)
+            if count <= 0:
+                return
+            products = um.get("products", {})
+            prod_txt = "、".join(f"{k}（{v}条）" for k, v in list(products.items())[:10])
+            if len(products) > 10:
+                prod_txt += f" 等共 {len(products)} 个商品"
+            st.warning(
+                f"⚠️ 本次{report_name}有 {count} 条订单未匹配到成本表花型"
+                f"（营业额 {um.get('amount', 0):.2f} 元，未计入报表），"
+                f"请在花型管理补建成本后重新生成即可归位：{prod_txt}"
+            )
+        except Exception:
+            pass
+
     # ---------- 在线生成日报 ----------
     st.subheader("📝 生成日报")
     st.info("💡 每次生成都会强制覆盖已有日报，先回退旧库存，再基于最新订单数据重新扣减")
 
-    gen_date = st.date_input("选择日期", value=date.today())
+    gen_date = st.date_input("选择日期", value=date.today(), key="gen_date_key")
     gen_btn = st.button("🚀 生成日报", type="primary")
     if gen_btn:
         from make_daily import generate_daily_report
@@ -687,6 +718,7 @@ elif menu == "📊 报告生成":
                 filepath = generate_daily_report(date_str, force=True)
                 if filepath and os.path.exists(filepath):
                     st.success(f"✅ {date_str} 日报生成成功！")
+                    _show_unmatched_warning("日报")
                     # 提供下载按钮
                     with open(filepath, "rb") as f:
                         st.download_button(
@@ -708,9 +740,9 @@ elif menu == "📊 报告生成":
 
     col1, col2 = st.columns(2)
     with col1:
-        range_start = st.date_input("开始日期", value=date(2026, 7, 1))
+        range_start = st.date_input("开始日期", value=date.today() - timedelta(days=30), key="range_start_date")
     with col2:
-        range_end = st.date_input("结束日期", value=date.today())
+        range_end = st.date_input("结束日期", value=date.today(), key="range_end_date")
 
     if st.button("🚀 生成区间报告", type="primary"):
         from make_daily import generate_range_report
@@ -722,6 +754,7 @@ elif menu == "📊 报告生成":
                 filepath = generate_range_report(start_str, end_str, force=True)
                 if filepath and os.path.exists(filepath):
                     st.success("✅ 区间报告生成成功！")
+                    _show_unmatched_warning("区间报告")
                     with open(filepath, "rb") as f:
                         st.download_button(
                             label="📥 下载区间报告 Excel",
@@ -839,18 +872,38 @@ elif menu == "⚙️ 库存调整":
     st.markdown("---")
 elif menu == "📊 退款明细":
     st.header("📊 退款明细表")
-    st.info("💡 显示已发货/已收货且退款成功的订单明细（按退款时间倒序）")
+    st.info("💡 只显示/统计「已发货/已收货 退款成功」的订单明细（未发货退款成功不入明细；按下单日期倒序，日期列如实为下单日期）")
 
-    # 同步按钮：清洗并刷新退款明细
+    # 同步按钮：从数据库实时同步，展示详细结果与逐单错误
     if st.button("🔄 同步并清洗退款明细", key="sync_refund_btn"):
-        with st.spinner("正在同步并清理历史脏数据..."):
+        with st.spinner("正在从数据库同步退款明细..."):
             try:
                 from populate_refund_details import sync_refund_details
-                sync_refund_details()
-                st.success("✅ 退款明细同步完成")
-                st.rerun()
+                result = sync_refund_details()
+                st.session_state['refund_sync_result'] = result
+                st.session_state.pop('refund_sync_error', None)
             except Exception as e:
-                st.error(f"❌ 同步失败：{e}")
+                st.session_state['refund_sync_result'] = None
+                st.session_state['refund_sync_error'] = str(e)
+        st.rerun()
+
+    # 展示最近一次同步的详细结果（含逐单错误）
+    _sync_res = st.session_state.get('refund_sync_result')
+    if _sync_res:
+        _errs = _sync_res.get('errors') or []
+        st.success(
+            f"✅ 同步完成：清洗 {_sync_res.get('cleaned', 0)} 条 | "
+            f"重写 {_sync_res.get('backfilled', 0)} 条 | "
+            f"未发货退款排除 {_sync_res.get('excluded_undelivered', 0)} 条 | "
+            f"找到已发货/已收货退款 {_sync_res.get('found', 0)} 条 → 写入 {_sync_res.get('synced', 0)} 条"
+        )
+        if _errs:
+            with st.expander(f"⚠️ {len(_errs)} 条订单同步出错（已跳过该条，其余正常写入）"):
+                st.code("\n".join(f"{o}: {m}" for o, m in _errs[:30]))
+        else:
+            st.caption("✅ 逐单写入无错误")
+    if st.session_state.get('refund_sync_error'):
+        st.error(f"❌ 同步失败：{st.session_state['refund_sync_error']}")
     # 查询退款明细
     with engine.connect() as conn:
         # 获取所有花型（用于筛选）
@@ -862,14 +915,19 @@ elif menu == "📊 退款明细":
         # 日期筛选器
         col1, col2, col3 = st.columns([2, 2, 1])
         with col1:
-            start_date = st.date_input("开始日期", value=date(2026, 7, 1))
+            start_date = st.date_input("开始日期", value=date.today() - timedelta(days=30), key="refund_start_date")
         with col2:
-            end_date = st.date_input("结束日期", value=date.today())
+            end_date = st.date_input("结束日期", value=date.today(), key="refund_end_date")
         with col3:
             selected_flower = st.selectbox("花型筛选", options=flower_list, index=0)
 
-        # 构建查询条件
-        conditions = ["refund_time >= :start", "refund_time <= :end"]
+        # 构建查询条件：只显示/统计「已发货/已收货 退款成功」，未发货退款成功排除
+        conditions = [
+            "refund_time >= :start",
+            "refund_time <= :end",
+            "after_sale_status LIKE '%退款成功%'",
+            "after_sale_status NOT LIKE '%未发货%'",
+        ]
         params = {"start": str(start_date), "end": str(end_date)}
         if selected_flower != "（全部）":
             conditions.append("flower = :flower")
@@ -885,7 +943,7 @@ elif menu == "📊 退款明细":
                     refund_meters AS '退款米数',
                     refund_amount AS '退款金额',
                     after_sale_status AS '售后状态',
-                    refund_time AS '退款时间'
+                    refund_time AS '下单日期'
                 FROM refund_detail
                 WHERE {where_clause}
                 ORDER BY refund_time DESC
@@ -894,13 +952,16 @@ elif menu == "📊 退款明细":
         df = pd.read_sql(query, conn, params=params)
 
         # 🔧 查询总营业额（排除所有退款和取消订单）
-        total_revenue_query = text("""
-                SELECT SUM(merchant_income) 
-                FROM data2026 
-                WHERE DATE(delivery_time) >= :start 
-                  AND DATE(delivery_time) <= :end
-                  AND order_status != '已取消'
-                  AND after_sale_status NOT LIKE '%退款成功%'
+        # 总营业额口径与日报一致：按下单日期统计，排除所有退款（售后/订单任一字段）与已取消/已关闭/交易关闭
+        total_revenue_query = text(f"""
+                SELECT SUM(merchant_income) FROM (
+                    SELECT merchant_income, order_status, after_sale_status, {ORDER_DATE_SQL} AS order_date
+                    FROM data2026
+                ) t
+                WHERE t.order_date >= :start
+                  AND t.order_date <= :end
+                  AND NOT (t.after_sale_status LIKE '%退款成功%' OR t.order_status LIKE '%退款成功%')
+                  AND t.order_status NOT IN ('已取消', '已关闭', '交易关闭')
             """)
         total_revenue = conn.execute(
             total_revenue_query,
@@ -1137,7 +1198,8 @@ elif menu == "⚙️ 系统设置":
         new_start_date = st.date_input(
             "选择新的起始日期",
             value=current_start_date,
-            max_value=datetime.now().date()
+            max_value=datetime.now().date(),
+            key="sys_start_date_key"
         )
     with col2:
         st.write("")
@@ -1253,6 +1315,51 @@ elif menu == "🌸 花型管理":
                     st.rerun()
                 else:
                     st.error(msg)
+
+    st.divider()
+
+    # ============= 修改花型名称 / 成本 =============
+    st.subheader("✏️ 修改花型名称 / 成本")
+    from add_del_flower import update_flower
+    edit_flowers_df = get_all_flowers(include_deleted=True)
+    if edit_flowers_df.empty:
+        st.info("暂无花型数据")
+    else:
+        edit_names = edit_flowers_df['flower'].tolist()
+        col_e1, col_e2 = st.columns([2, 1])
+        with col_e1:
+            edit_target = st.selectbox(
+                "选择花型",
+                options=edit_names,
+                index=None,
+                placeholder="请选择要修改的花型...",
+                key="edit_flower_target"
+            )
+        if edit_target:
+            cur_row = edit_flowers_df[edit_flowers_df['flower'] == edit_target].iloc[0]
+            cur_cost = float(cur_row['cost_per_meter'])
+            deleted_note = "（已删除花型）" if cur_row['is_deleted'] == 1 else ""
+            st.info(f"当前：花型「{edit_target}」{deleted_note}，成本 {cur_cost:.2f} 元/米")
+            with st.form("edit_flower_form"):
+                col_n1, col_n2 = st.columns(2)
+                with col_n1:
+                    new_name = st.text_input("新名称（默认=不改名）", value=edit_target)
+                with col_n2:
+                    new_cost = st.number_input(
+                        "新成本单价（元/米）", min_value=0.0, step=0.1,
+                        format="%.2f", value=cur_cost
+                    )
+                submitted_edit = st.form_submit_button("💾 确认修改", type="primary")
+            if submitted_edit:
+                success, msg = update_flower(edit_target, new_name, new_cost, "admin")
+                if success:
+                    st.success(msg)
+                    st.cache_data.clear()
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(msg)
+        st.caption("💡 改名会级联更新所有关联数据（库存/快照/流水/退款明细/日报缓存等）；改成本后重新生成日报/区间/月报即按新成本计算")
 
     st.divider()
 
