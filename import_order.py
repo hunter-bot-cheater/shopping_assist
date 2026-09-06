@@ -538,7 +538,7 @@ def import_excel(file_path=None):
         _message = f"成功导入 {len(df)} 条数据到 {orders} 表"
         if _pending:
             _stats["待建档新商品"] = _pending
-            _message += f"；⚠️ {len(_pending)} 个商品未在成本表建档，将单独汇总为「待建成本」"
+            _message += f"；⚠️ {len(_pending)} 个商品未在成本表建档，未计入报表，仅在页面提示"
         return {
             "success": True,
             "message": _message,
@@ -956,7 +956,7 @@ def import_excel_from_dataframe(df, filename="web_upload.xlsx"):
         _message = f"成功导入 {total} 条数据到 {orders} 表"
         if _pending:
             stats["待建档新商品"] = _pending
-            _message += f"；⚠️ {len(_pending)} 个商品未在成本表建档，将单独汇总为「待建成本」"
+            _message += f"；⚠️ {len(_pending)} 个商品未在成本表建档，未计入报表，仅在页面提示"
         return {
             "success": True,
             "message": _message,
