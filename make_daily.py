@@ -938,7 +938,7 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
                         if current_meters <= 0.001:
                             continue
                         try:
-                            deduct_stock(
+                            _deduct_ok = deduct_stock(
                                 flower=flower,
                                 qty=current_meters,
                                 reference=f"日报自动扣减 {target_date}",
@@ -947,8 +947,9 @@ def generate_daily_report(target_date=None, force=True, orders=orders):
                                 is_daily_sales=True,
                                 conn=conn
                             )
-                            deducted_count += 1
-                            print(f"  ✅ {flower}: 扣减 {current_meters:.1f} 米")
+                            if _deduct_ok:
+                                deducted_count += 1
+                                print(f"  ✅ {flower}: 扣减 {current_meters:.1f} 米")
                         except ValueError as e:
                             print(f"  ⚠️ {e}，跳过该花型")
 

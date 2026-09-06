@@ -345,14 +345,14 @@ def deduct_stock(flower, qty, reference="销售出库", operator="system", repor
 
     if conn is not None:
         # 调用方已开启事务：直接执行，提交/回滚由调用方负责
-        _deduct_stock_core(conn, flower, qty, reference, operator, report_date, is_daily_sales)
-        return
+        return _deduct_stock_core(conn, flower, qty, reference, operator, report_date, is_daily_sales)
 
     with engine.connect() as conn:
         trans = conn.begin()
         try:
-            _deduct_stock_core(conn, flower, qty, reference, operator, report_date, is_daily_sales)
+            result = _deduct_stock_core(conn, flower, qty, reference, operator, report_date, is_daily_sales)
             trans.commit()
+            return result
         except Exception as e:
             trans.rollback()
             raise e
@@ -368,7 +368,7 @@ def _deduct_stock_core(conn, flower, qty, reference, operator, report_date, is_d
         ).fetchone()
         if anchor_row is not None and anchor_row[0]:
             print(f"⏭️ {flower} {report_date} 为手动锚点（is_manual=1），日报扣减跳过，锚点为实盘数")
-            return
+            return False
 
     # 1. 确保目标日期及之后有快照记录（沿用原逻辑，缺失时先补全）
     check_snapshot = conn.execute(
@@ -453,6 +453,7 @@ def _deduct_stock_core(conn, flower, qty, reference, operator, report_date, is_d
         print(f"⚠️ {flower} 库存不足：当前 {snap_before} 米，出库 {qty} 米，实际扣减 {actual_deduct} 米，库存保持为 0")
     else:
         print(f"✅ {flower} 扣减 {qty} 米（剩余：{snap_after}）")
+    return True
 # 核心功能 4：查看所有库存
 # =============================================
 def get_inventory_report():
